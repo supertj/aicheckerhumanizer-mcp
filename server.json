@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.supertj/aicheckerhumanizer",
+  "title": "AI Checker Humanizer",
+  "description": "Check for AI writing and humanize text. Get sentence scores in English and Portuguese.",
+  "websiteUrl": "https://aicheckerhumanizer.com/ai-detector-api",
+  "repository": {
+    "url": "https://github.com/supertj/aicheckerhumanizer-mcp",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://aicheckerhumanizer.com/api/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer followed by your API key from https://aicheckerhumanizer.com/account#api",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
