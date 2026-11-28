@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from asyncio import sleep as async_sleep
 from time import monotonic, sleep
 from typing import Any
 
@@ -85,7 +86,7 @@ class AICheckerHumanizerDetectTool(BaseTool):
         try:
             result = self.api_wrapper.detect(text, idempotency_key=idempotency_key)
         except AICheckerHumanizerError as exc:
-            raise ToolException(exc.message) from exc
+            raise _tool_error(exc) from exc
         return json.dumps(result, ensure_ascii=False)
 
     async def _arun(self, text: str, idempotency_key: str | None = None) -> str:
@@ -94,7 +95,7 @@ class AICheckerHumanizerDetectTool(BaseTool):
                 text, idempotency_key=idempotency_key
             )
         except AICheckerHumanizerError as exc:
-            raise ToolException(exc.message) from exc
+            raise _tool_error(exc) from exc
         return json.dumps(result, ensure_ascii=False)
 
 
@@ -106,7 +107,10 @@ def _poll_delay(task: dict[str, Any]) -> int:
 
 
 def _humanize_result(
-    task: dict[str, Any], error: AICheckerHumanizerError | None = None
+    task: dict[str, Any],
+    *,
+    skipped_words: int | None,
+    error: AICheckerHumanizerError | None = None,
 ) -> str:
     if task.get("status") in _PENDING_STATUSES:
         message = (
@@ -118,39 +122,45 @@ def _humanize_result(
         task = {field: task[field] for field in fields if field in task}
         task["message"] = message
         if error is not None:
-            task["error"] = error.code
-            task["message"] = f"{error.message} {message}"
-            if error.retry_after is not None:
-                task["retryAfter"] = error.retry_after
+            task = {
+                **task,
+                **_error_fields(error),
+                "taskId": task["taskId"],
+                "status": task["status"],
+                "message": f"{error.message} {message}",
+            }
+    if skipped_words is not None:
+        task = {**task, "skippedWords": skipped_words}
     return json.dumps(task, ensure_ascii=False)
 
 
-def _poll_error_result(task: dict[str, Any], error: AICheckerHumanizerError) -> str:
+def _poll_error_result(
+    task: dict[str, Any], error: AICheckerHumanizerError, *, skipped_words: int | None
+) -> str:
     status = error.status
     if status is None or status == 429 or 500 <= status < 600:
-        return _humanize_result(task, error)
-    raise ToolException(_task_error_message(task["taskId"], error)) from error
+        return _humanize_result(task, skipped_words=skipped_words, error=error)
+    raise _tool_error(error, task_id=task["taskId"]) from error
 
 
-def _task_error_message(task_id: str, error: AICheckerHumanizerError) -> str:
-    if error.code == "invalid_response" or (
-        error.status == 410 and error.code == "result_expired"
-    ):
-        details = {
-            field: error.body[field]
-            for field in ("status", "creditsCharged", "expiredAt")
-            if field in error.body
-        }
-        return json.dumps(
-            {
-                "error": error.code,
-                "message": error.message,
-                "taskId": task_id,
-                **details,
-            },
-            ensure_ascii=False,
-        )
-    return error.message
+def _error_fields(error: AICheckerHumanizerError) -> dict[str, Any]:
+    fields = {**error.body, "error": error.code, "message": error.message}
+    if error.status is not None:
+        fields["httpStatus"] = error.status
+    if error.retry_after is not None:
+        fields["retryAfter"] = error.retry_after
+    if error.status == 410 and "status" in fields:
+        fields["taskStatus"] = fields["status"]
+    return fields
+
+
+def _tool_error(
+    error: AICheckerHumanizerError, *, task_id: str | None = None
+) -> ToolException:
+    fields = _error_fields(error)
+    if task_id is not None:
+        fields["taskId"] = task_id
+    return ToolException(json.dumps(fields, ensure_ascii=False))
 
 
 class AICheckerHumanizerHumanizeTool(BaseTool):
@@ -187,10 +197,11 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                 text, mode=mode, strength=strength, idempotency_key=idempotency_key
             )
         except AICheckerHumanizerError as exc:
-            raise ToolException(exc.message) from exc
+            raise _tool_error(exc) from exc
 
+        skipped_words = task.get("skippedWords")
         if task.get("status") not in _PENDING_STATUSES or not self.max_wait_seconds:
-            return _humanize_result(task)
+            return _humanize_result(task, skipped_words=skipped_words)
 
         deadline = monotonic() + self.max_wait_seconds
         with httpx.Client() as client:
@@ -209,8 +220,8 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                         client=client,
                     )
                 except AICheckerHumanizerError as exc:
-                    return _poll_error_result(task, exc)
-        return _humanize_result(task)
+                    return _poll_error_result(task, exc, skipped_words=skipped_words)
+        return _humanize_result(task, skipped_words=skipped_words)
 
     async def _arun(
         self,
@@ -224,10 +235,11 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                 text, mode=mode, strength=strength, idempotency_key=idempotency_key
             )
         except AICheckerHumanizerError as exc:
-            raise ToolException(exc.message) from exc
+            raise _tool_error(exc) from exc
 
+        skipped_words = task.get("skippedWords")
         if task.get("status") not in _PENDING_STATUSES or not self.max_wait_seconds:
-            return _humanize_result(task)
+            return _humanize_result(task, skipped_words=skipped_words)
 
         deadline = monotonic() + self.max_wait_seconds
         async with httpx.AsyncClient() as client:
@@ -235,7 +247,7 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                 delay = _poll_delay(task)
                 if delay >= deadline - monotonic():
                     break
-                await asyncio.sleep(delay)
+                await async_sleep(delay)
                 remaining = deadline - monotonic()
                 if remaining <= 0:
                     break
@@ -247,15 +259,16 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                 except asyncio.TimeoutError:
                     return _humanize_result(
                         task,
-                        AICheckerHumanizerError(
+                        skipped_words=skipped_words,
+                        error=AICheckerHumanizerError(
                             status=None,
                             code="timeout",
                             message=_REQUEST_TIMEOUT_MESSAGE,
                         ),
                     )
                 except AICheckerHumanizerError as exc:
-                    return _poll_error_result(task, exc)
-        return _humanize_result(task)
+                    return _poll_error_result(task, exc, skipped_words=skipped_words)
+        return _humanize_result(task, skipped_words=skipped_words)
 
 
 class AICheckerHumanizerGetResultTool(BaseTool):
@@ -278,14 +291,14 @@ class AICheckerHumanizerGetResultTool(BaseTool):
         try:
             task = self.api_wrapper.humanize_get(task_id)
         except AICheckerHumanizerError as exc:
-            raise ToolException(_task_error_message(task_id, exc)) from exc
+            raise _tool_error(exc, task_id=task_id) from exc
         return json.dumps(task, ensure_ascii=False)
 
     async def _arun(self, task_id: str) -> str:
         try:
             task = await self.api_wrapper.ahumanize_get(task_id)
         except AICheckerHumanizerError as exc:
-            raise ToolException(_task_error_message(task_id, exc)) from exc
+            raise _tool_error(exc, task_id=task_id) from exc
         return json.dumps(task, ensure_ascii=False)
 
 

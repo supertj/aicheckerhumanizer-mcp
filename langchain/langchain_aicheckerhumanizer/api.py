@@ -40,7 +40,11 @@ class HumanizeStrength(str, Enum):
 
 
 class AICheckerHumanizerError(Exception):
-    """An API or transport error. Status is None if no response was received."""
+    """An API or transport error.
+
+    Status is None when the request fails before HTTPX returns a response.
+    Resubmitting an expired rewrite reports status 410.
+    """
 
     def __init__(
         self,
@@ -130,22 +134,27 @@ def _parse_response(
     except ValueError:
         data = None
 
-    if not response.is_success:
+    status = response.status_code
+    if (
+        path == "/humanize"
+        and status == 202
+        and isinstance(data, dict)
+        and data.get("error") == "result_expired"
+    ):
+        status = 410
+
+    if not 200 <= status < 300:
         error = data if isinstance(data, dict) else {}
         code = error.get("error")
         message = error.get("message")
         if not isinstance(message, str) or not message:
-            message = f"AI Checker Humanizer returned HTTP {response.status_code}."
+            message = f"AI Checker Humanizer returned HTTP {status}."
         retry_key = (
-            submission_key
-            if response.status_code >= 500
-            or not isinstance(code, str)
-            or code == "in_progress"
-            else None
+            submission_key if 500 <= status < 600 or code == "in_progress" else None
         )
         retry_after = _integer(error, "retryAfter")
         raise AICheckerHumanizerError(
-            status=response.status_code,
+            status=status,
             code=code if isinstance(code, str) else "http_error",
             message=_submission_message(message, retry_key),
             retry_after=(
@@ -160,12 +169,9 @@ def _parse_response(
 
     if not isinstance(data, dict) or not _valid_response(data, path):
         raise AICheckerHumanizerError(
-            status=response.status_code,
+            status=status,
             code="invalid_response",
-            message=_submission_message(
-                "AI Checker Humanizer returned an invalid response.", submission_key
-            ),
-            idempotency_key=submission_key,
+            message="AI Checker Humanizer returned an invalid response.",
         )
 
     if path.startswith("/humanize"):
@@ -181,6 +187,7 @@ def _parse_response(
 def _request_error(
     exc: httpx.RequestError | httpx.InvalidURL, *, submission_key: str | None = None
 ) -> AICheckerHumanizerError:
+    retry_key = submission_key if isinstance(exc, httpx.TransportError) else None
     if isinstance(exc, httpx.TimeoutException):
         code = "timeout"
         message = _REQUEST_TIMEOUT_MESSAGE
@@ -190,8 +197,8 @@ def _request_error(
     return AICheckerHumanizerError(
         status=None,
         code=code,
-        message=_submission_message(message, submission_key),
-        idempotency_key=submission_key,
+        message=_submission_message(message, retry_key),
+        idempotency_key=retry_key,
     )
 
 

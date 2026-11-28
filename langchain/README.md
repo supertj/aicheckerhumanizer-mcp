@@ -31,7 +31,13 @@ Each tool returns a JSON string on success and supports `ainvoke`. Detection acc
 - Mode can be `standard` (default), `academic`, `casual` or `concise`.
 - Strength can be `light`, `medium` (default) or `heavy`.
 
-The rewrite tool polls for the result within a 120-second window after submission. If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If a status check fails with a temporary error, the response also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission. After it expires, `get_result` can return a `result_expired` error with the task status, credits charged and expiry time.
+By default, the rewrite tool gives status checks a 120-second budget after submission. If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If a status check fails with a temporary error, the response also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission.
+
+When the API reports an expired result, `get_result` returns `result_expired` with `httpStatus` 410. Resubmitting with the same `idempotency_key` within 24 hours reports the same error. The response also includes `taskStatus`, `creditsCharged` and `expiredAt` when available.
+
+`skippedWords` counts words left unchanged because their language is unsupported or the chosen mode is unavailable for that language. If the API returns the count when you submit, the rewrite tool includes it in both pending and final results.
+
+With the default error handling, a failed tool call returns a JSON string with the API's error fields and `httpStatus` if the server responded.
 
 ## Use the toolkit in an agent
 
