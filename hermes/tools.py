@@ -2,6 +2,7 @@
 
 import json
 import math
+import re
 import time
 from contextlib import closing
 from datetime import UTC
@@ -13,14 +14,20 @@ from uuid import UUID, uuid4
 API_KEY_NAME = "AICHECKERHUMANIZER_API_KEY"
 MODES = ("standard", "academic", "casual", "concise")
 STRENGTHS = ("light", "medium", "heavy")
+IDEMPOTENCY_KEY_PATTERN = r"^[\x21-\x7e]+$"
 
 _API_HOST = "aicheckerhumanizer.com"
 _API_PATH = "/api/v1"
 _USER_AGENT = "aicheckerhumanizer-hermes/0.1.0"
+_DETECT_TIMEOUT = 65  # The synchronous endpoint can run for 60 seconds.
 _OTHER_TIMEOUT = 30
 _HUMANIZE_WAIT = 50
 _POLL_INTERVAL = 2.5
 _PENDING = ("queued", "running")
+
+
+class SecretScopeUnavailableError(Exception):
+    pass
 
 
 def _json(result):
@@ -57,11 +64,12 @@ def _http_error(status, payload, retry_after):
     }
     for field in (
         "retryAfter", "creditsRemaining", "creditsNeeded", "maxWords", "maxUnits", "units",
-        "taskId", "taskStatus", "creditsCharged",
+        "taskId", "taskStatus", "creditsCharged", "expiredAt",
     ):
         if field in payload:
             result[field] = payload[field]
     if status == 410 and isinstance(payload.get("status"), str):
+        result["status"] = payload["status"]
         result.setdefault("taskStatus", payload["status"])
     if retry_after is not None:
         result.setdefault("retryAfter", retry_after)
@@ -101,6 +109,13 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
     return payload, retry_after
 
 
+def _get_task(key, task_id, *, timeout):
+    result, retry_after = _request(key, "GET", f"/humanize/{task_id}", timeout=timeout)
+    if "error" not in result and not isinstance(result.get("status"), str):
+        return _error("invalid_response", "The rewrite response did not include a valid status."), None
+    return result, retry_after
+
+
 def _normalize_task_id(task_id):
     if isinstance(task_id, str):
         try:
@@ -115,7 +130,14 @@ class Tools:
         self.get_secret = get_secret
 
     def _api_key(self):
-        key = (self.get_secret(API_KEY_NAME) or "").strip()
+        try:
+            key = (self.get_secret(API_KEY_NAME) or "").strip()
+        except SecretScopeUnavailableError:
+            return None, _error(
+                "secret_scope_unavailable",
+                "Hermes could not read the profile's secrets for this call. Check that Hermes runs the tool "
+                "in the profile where AICHECKERHUMANIZER_API_KEY is set.",
+            )
         if not key:
             return None, _error(
                 "missing_api_key",
@@ -137,13 +159,11 @@ class Tools:
         idempotency_key = args.get("idempotency_key")
         if idempotency_key is not None and (
             not isinstance(idempotency_key, str)
-            or not idempotency_key
-            or not idempotency_key.isascii()
-            or not idempotency_key.isprintable()
             or len(idempotency_key) > 128
+            or not re.fullmatch(IDEMPOTENCY_KEY_PATTERN, idempotency_key)
         ):
             return key, _error(
-                "invalid_request", "Use 1 to 128 printable ASCII characters for idempotency_key."
+                "invalid_request", "Use 1 to 128 visible ASCII characters (! through ~) for idempotency_key."
             ), None, None
         if idempotency_key is None:
             idempotency_key = str(uuid4())
@@ -155,14 +175,17 @@ class Tools:
         return key, result, retry_after, idempotency_key
 
     def detect_ai_text(self, args, **kwargs):
-        _, result, _, idempotency_key = self._submit(args, "/detect", timeout=60)
-        if result.get("error") == "network_error":
-            result["idempotency_key"] = idempotency_key
+        _, result, _, idempotency_key = self._submit(args, "/detect", timeout=_DETECT_TIMEOUT)
+        if "error" not in result and not {"score", "verdict"} <= result.keys():
+            result = _error("invalid_response", "AI Checker Humanizer returned an invalid response.")
+        if result.get("error") in ("network_error", "invalid_response"):
             result["message"] = (
                 "The detection result is unknown and the request may have used credits. "
-                "Retry detect_ai_text within 24 hours. Use the returned idempotency_key "
-                "and the same text."
+                "To avoid a second charge, retry detect_ai_text within 24 hours with the returned "
+                "idempotency_key and the same text."
             )
+        if "error" in result and idempotency_key is not None:
+            result["idempotency_key"] = idempotency_key
         return _json(result)
 
     def humanize_text(self, args, **kwargs):
@@ -195,9 +218,11 @@ class Tools:
             result = _error("invalid_response", "The rewrite response did not include a valid task ID.")
             result["idempotency_key"] = idempotency_key
             return _json(result)
-        path = f"/humanize/{task_id}"
+        # An accepted replay can include a task ID before its current status is available.
+        if not isinstance(result.get("status"), str):
+            result["status"] = "pending"
 
-        while result.get("status") in _PENDING:
+        while "error" not in result and result.get("status") in _PENDING:
             pending = {
                 "taskId": task_id,
                 "status": result["status"],
@@ -211,9 +236,7 @@ class Tools:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return _json(pending)
-            result, retry_after = _request(
-                key, "GET", path, timeout=min(_OTHER_TIMEOUT, remaining),
-            )
+            result, retry_after = _get_task(key, task_id, timeout=min(_OTHER_TIMEOUT, remaining))
             if result.get("error") == "network_error":
                 if time.monotonic() < deadline:
                     pending["error"] = result["error"]
@@ -234,7 +257,7 @@ class Tools:
                 "invalid_request", "Provide the task ID returned by humanize_text.",
             ))
         if result is None:
-            result, _ = _request(key, "GET", f"/humanize/{task_id}", timeout=_OTHER_TIMEOUT)
+            result, _ = _get_task(key, task_id, timeout=_OTHER_TIMEOUT)
         result["taskId"] = task_id
         return _json(result)
 

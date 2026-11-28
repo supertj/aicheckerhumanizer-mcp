@@ -1,12 +1,14 @@
 import json
+import sys
 from datetime import UTC, datetime
 from email.utils import format_datetime
+from types import ModuleType
 from unittest.mock import MagicMock, Mock
 from uuid import UUID
 
 import pytest
 
-from hermes import tools
+from hermes import register, tools
 
 _KEY = "ach_live_" + "x" * 32
 _TASK_ID = "74b33b79-d17b-4f1a-b765-9a952f01d270"
@@ -61,7 +63,7 @@ def test_detect_returns_api_result_and_passes_idempotency_key(handlers, http):
 
     assert result == json.dumps(payload, separators=(",", ":"))
     handlers.get_secret.assert_called_once_with("AICHECKERHUMANIZER_API_KEY")
-    connect.assert_called_once_with("aicheckerhumanizer.com", timeout=60)
+    connect.assert_called_once_with("aicheckerhumanizer.com", timeout=65)
     connection.request.assert_called_once_with(
         "POST", "/api/v1/detect", body=b'{"text":"Check this."}', headers={
             "Authorization": f"Bearer {_KEY}",
@@ -83,10 +85,18 @@ def test_detect_without_verdict(handlers, http):
 
 
 @pytest.mark.parametrize("key", [None, "detect-123"])
-def test_detect_network_error_can_be_retried_with_same_key(handlers, http, key):
+@pytest.mark.parametrize(("failure", "code", "status"), [
+    (TimeoutError, "network_error", None),
+    (OSError, "network_error", None),
+    (response(502, b"<html>Bad Gateway</html>"), "http_error", 502),
+    (response(503, {"error": "detection_unavailable"}), "detection_unavailable", 503),
+    (response(200, b"<html>Unexpected response</html>"), "invalid_response", None),
+    (response(200, {}), "invalid_response", None),
+])
+def test_detect_uncertain_result_can_be_retried_with_same_key(handlers, http, key, failure, code, status):
     _, connection = http
     detected = {"score": 92, "verdict": {"label": "likely_ai"}}
-    connection.getresponse.side_effect = [TimeoutError, response(200, detected)]
+    connection.getresponse.side_effect = [failure, response(200, detected)]
     args = {"text": "Check this."}
     if key is not None:
         args["idempotency_key"] = key
@@ -98,15 +108,12 @@ def test_detect_network_error_can_be_retried_with_same_key(handlers, http, key):
         assert UUID(submitted_key).version == 4
     else:
         assert submitted_key == key
-    assert result == {
-        "error": "network_error",
-        "message": (
-            "The detection result is unknown and the request may have used credits. "
-            "Retry detect_ai_text within 24 hours. Use the returned idempotency_key "
-            "and the same text."
-        ),
-        "idempotency_key": submitted_key,
-    }
+    assert result["error"] == code
+    assert result.get("httpStatus") == status
+    assert result["idempotency_key"] == submitted_key
+    if code in ("network_error", "invalid_response"):
+        assert "request may have used credits" in result["message"]
+        assert "within 24 hours" in result["message"]
     assert connection.request.call_count == 1
 
     retry = handlers.detect_ai_text({**args, "idempotency_key": result["idempotency_key"]})
@@ -158,6 +165,19 @@ def test_humanize_returns_terminal_post_without_polling(handlers, http, clock, s
     assert json.loads(post.kwargs["body"]) == {
         "text": "Rewrite this.", "mode": "academic", "strength": "heavy",
     }
+
+
+def test_humanize_accepts_a_replayed_task_id_without_status(handlers, http, clock):
+    accepted = {"taskId": _TASK_ID, "replayed": True}
+    complete = {"taskId": _TASK_ID, "status": "completed", "output": "Rewritten text."}
+    http[1].getresponse.side_effect = [response(202, accepted), response(200, complete)]
+
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {**accepted, "status": "pending", "idempotency_key": "rewrite-123"}
+    assert clock.sleeps == []
+    assert http[1].request.call_count == 1
+    assert json.loads(handlers.get_humanize_result({"task_id": _TASK_ID})) == complete
 
 
 @pytest.mark.parametrize("key", [None, "rewrite-123"])
@@ -289,6 +309,31 @@ def test_get_task(handlers, http):
     connect.assert_called_once_with("aicheckerhumanizer.com", timeout=30)
 
 
+@pytest.mark.parametrize(("poll", "status"), [(False, "completed"), (True, "completed"), (True, "running")])
+def test_expired_task_keeps_status_charge_and_expiration(handlers, http, clock, poll, status):
+    payload = {
+        "error": "result_expired",
+        "message": "The result has expired.",
+        "taskId": _TASK_ID,
+        "status": status,
+        "creditsCharged": 50,
+        "expiredAt": "2027-01-23T00:00:00Z",
+    }
+    replies = [response(410, payload)]
+    expected = {**payload, "httpStatus": 410, "taskStatus": status}
+    if poll:
+        replies.insert(0, response(202, {"taskId": _TASK_ID, "status": "queued"}))
+        expected["idempotency_key"] = "rewrite-123"
+    http[1].getresponse.side_effect = replies
+
+    if poll:
+        result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+    else:
+        result = handlers.get_humanize_result({"task_id": _TASK_ID})
+
+    assert json.loads(result) == expected
+
+
 @pytest.mark.parametrize("task_id", [_TASK_ID, f"{{{_TASK_ID}}}", f"urn:uuid:{_TASK_ID}", UUID(_TASK_ID).hex])
 def test_get_task_network_error_returns_normalized_task_id(handlers, http, task_id):
     http[1].getresponse.side_effect = TimeoutError
@@ -320,7 +365,6 @@ def test_get_balance(handlers, http):
     (404, "not_found", {}),
     (409, "in_progress", {"retryAfter": 3}),
     (409, "busy", {"retryAfter": 4}),
-    (410, "result_expired", {"taskStatus": "completed", "creditsCharged": 5}),
     (413, "too_long", {"maxWords": 10_000}),
     (413, "too_many_units", {"maxUnits": 200, "units": 201}),
     (422, "language_unsupported", {}),
@@ -335,13 +379,11 @@ def test_get_balance(handlers, http):
 ])
 def test_http_error_keeps_code_message_and_fields(handlers, http, status, code, fields):
     payload = {"error": code, "message": "Service detail.", **fields}
-    if "taskStatus" in fields:
-        payload["status"] = payload.pop("taskStatus")
     http[1].getresponse.side_effect = [response(status, payload)]
 
-    result = handlers.detect_ai_text({"text": "Check this."})
+    result = handlers.detect_ai_text({"text": "Check this.", "idempotency_key": "detect-123"})
 
-    assert json.loads(result) == {"error": code, "message": "Service detail.", "httpStatus": status, **fields}
+    assert json.loads(result) == {**payload, "httpStatus": status, "idempotency_key": "detect-123"}
     assert http[1].request.call_count == 1
 
 
@@ -385,6 +427,30 @@ def test_poll_error_is_returned_without_retry(handlers, http, clock):
     }
     assert clock.sleeps == [2.5]
     assert http[1].request.call_count == 2
+
+
+@pytest.mark.parametrize("body", [{}, {"status": 1}, {"status": None}])
+def test_poll_without_string_status_returns_invalid_response(handlers, http, clock, body):
+    http[1].getresponse.side_effect = [
+        response(202, {"taskId": _TASK_ID, "status": "running"}),
+        response(200, body),
+    ]
+
+    result = json.loads(handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"}))
+
+    assert result["error"] == "invalid_response"
+    assert result["taskId"] == _TASK_ID
+    assert result["idempotency_key"] == "rewrite-123"
+    assert http[1].request.call_count == 2
+
+
+def test_get_task_without_status_returns_invalid_response(handlers, http):
+    http[1].getresponse.side_effect = [response(200, {"taskId": _TASK_ID})]
+
+    result = json.loads(handlers.get_humanize_result({"task_id": _TASK_ID}))
+
+    assert result["error"] == "invalid_response"
+    assert result["taskId"] == _TASK_ID
 
 
 def test_poll_network_error_before_deadline_returns_pending_task(handlers, http, clock):
@@ -452,6 +518,31 @@ def test_missing_api_key(handler, arguments, http):
     http[0].assert_not_called()
 
 
+def test_registered_handlers_report_unscoped_hermes_secrets(monkeypatch, http):
+    class UnscopedSecretError(RuntimeError):
+        pass
+
+    secret_scope = ModuleType("agent.secret_scope")
+    secret_scope.UnscopedSecretError = UnscopedSecretError
+    secret_scope.get_secret = Mock(side_effect=UnscopedSecretError("internal gateway detail"))
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+    ctx = Mock()
+    register(ctx)
+    handlers = {call.kwargs["name"]: call.kwargs["handler"] for call in ctx.register_tool.call_args_list}
+
+    for name, args in {
+        "detect_ai_text": {"text": "Check this."},
+        "humanize_text": {"text": "Rewrite this."},
+        "get_humanize_result": {"task_id": _TASK_ID},
+        "get_balance": {},
+    }.items():
+        result = json.loads(handlers[name](args))
+        assert result["error"] == "secret_scope_unavailable"
+        assert "Hermes" in result["message"]
+        assert "internal gateway detail" not in result["message"]
+    http[0].assert_not_called()
+
+
 @pytest.mark.parametrize("options", [{"mode": "formal"}, {"strength": "high"}])
 def test_invalid_humanize_options_cannot_reach_http(handlers, http, options):
     result = handlers.humanize_text({"text": "Rewrite this.", **options})
@@ -460,12 +551,21 @@ def test_invalid_humanize_options_cannot_reach_http(handlers, http, options):
     http[0].assert_not_called()
 
 
-@pytest.mark.parametrize("key", ["bad\nheader", "é", "x" * 129, ""])
-def test_invalid_idempotency_key_cannot_reach_http(handlers, http, key):
-    result = handlers.detect_ai_text({"text": "Check this.", "idempotency_key": key})
+@pytest.mark.parametrize("handler", ["detect_ai_text", "humanize_text"])
+@pytest.mark.parametrize("key", ["bad\nheader", "trailing\n", "check 1", " ", "é", "\x7f", "x" * 129, ""])
+def test_invalid_idempotency_key_cannot_reach_http(handlers, http, handler, key):
+    result = getattr(handlers, handler)({"text": "Check this.", "idempotency_key": key})
 
     assert json.loads(result)["error"] == "invalid_request"
     http[0].assert_not_called()
+
+
+@pytest.mark.parametrize("key", ["!", "~" * 128])
+def test_idempotency_key_accepts_visible_ascii_and_length_boundaries(handlers, http, key):
+    http[1].getresponse.side_effect = [response(200, {"score": None, "verdict": None})]
+
+    assert "error" not in json.loads(handlers.detect_ai_text({"text": "Check this.", "idempotency_key": key}))
+    assert http[1].request.call_args.kwargs["headers"]["Idempotency-Key"] == key
 
 
 def test_invalid_task_id_cannot_change_request_path(handlers, http):

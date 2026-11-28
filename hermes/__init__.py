@@ -1,12 +1,18 @@
 """Register the AI Checker Humanizer tools with Hermes."""
 
-from .tools import MODES, STRENGTHS, Tools
+from .tools import (
+    IDEMPOTENCY_KEY_PATTERN,
+    MODES,
+    STRENGTHS,
+    SecretScopeUnavailableError,
+    Tools,
+)
 
 _IDEMPOTENCY_KEY = {
     "type": "string",
     "minLength": 1,
     "maxLength": 128,
-    "pattern": "^[ -~]+$",
+    "pattern": IDEMPOTENCY_KEY_PATTERN,
     "description": "Reuse the same key, text, and options within 24 hours to avoid a second charge.",
 }
 _HTTP_ERROR = " HTTP errors include httpStatus."
@@ -18,8 +24,8 @@ def register(ctx):
     def read_profile_secret(name):
         try:
             return get_secret(name)
-        except UnscopedSecretError:
-            return None
+        except UnscopedSecretError as error:
+            raise SecretScopeUnavailableError from error
 
     tools = Tools(read_profile_secret)
     ctx.register_tool(
@@ -33,8 +39,8 @@ def register(ctx):
                 "when available, or a reason if there is no verdict. English and Portuguese "
                 "can include sentence scores. Spanish and French get whole-text results. "
                 "Costs one credit per scored word only when there is a verdict. The tool "
-                "generates an idempotency key if you omit it. If detection returns "
-                "network_error, the request may already have used credits. Retry with the returned "
+                "generates an idempotency key if you omit it. It returns the key on network or "
+                "API errors and when the response is invalid. If you retry, use the returned "
                 "idempotency_key and the same text within 24 hours to avoid a second charge."
                 + _HTTP_ERROR
             ),
@@ -56,9 +62,10 @@ def register(ctx):
             "name": "humanize_text",
             "description": (
                 "Rewrite up to 3,000 words. The API splits the text into chunks and rejects "
-                "requests over 200 chunks. Returns the rewritten text when available. Polls "
-                "for up to 50 seconds. If the task is pending or a status check fails, use "
-                "the returned taskId with get_humanize_result. The tool generates an "
+                "requests over 200 chunks. Waits up to about 50 seconds for the rewritten text. "
+                "If the API accepts the request without a status, the tool returns the task ID immediately. "
+                "Use the returned taskId with get_humanize_result if the status is queued, running, "
+                "or pending, or if a status check fails. The tool generates an "
                 "idempotency key if you omit it. It returns the key with pending and finished "
                 "tasks, API errors, network errors, and invalid responses. If you retry a failed "
                 "submission, reuse the returned idempotency_key with the same text and options "
@@ -97,6 +104,8 @@ def register(ctx):
             "description": (
                 "Look up a rewrite by task ID. Returns the task status and any rewritten "
                 "text. Results are available for about 70 minutes after submission. "
+                "An expired result can include creditsCharged, expiredAt, and the task state in both "
+                "status and taskStatus. "
                 "Looking up a task costs no credits."
                 + _HTTP_ERROR
             ),
