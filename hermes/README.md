@@ -30,7 +30,7 @@ hermes plugins install 'https://github.com/supertj/aicheckerhumanizer-mcp#hermes
 | `get_humanize_result` | `task_id` from `humanize_text`. | The task status and any rewritten text. The result is available for about 70 minutes after submission. |
 | `get_balance` | None. | Remaining credits and when each batch expires. |
 
-See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields and error codes.
+HTTP errors include the response code in `httpStatus`. Rewrite tasks report their state in `status`. An expired result (HTTP 410) can include its last state in `taskStatus`. See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields and error codes.
 
 ## Credits
 
@@ -40,7 +40,7 @@ At $10 for 250,000 Starter credits, 1,000 scored words cost $0.04 and 1,000 bill
 
 The plugin uses the same API key and credit balance as REST and the hosted MCP server. To avoid a second charge, reuse the `idempotency_key` with the same text and options within 24 hours. The key must be 1 to 128 printable ASCII characters. When you reuse the key, detection returns the saved result and a rewrite returns the original task ID.
 
-`humanize_text` generates an idempotency key if you omit it and returns the key when the API accepts the rewrite. If submission returns `network_error`, call `humanize_text` again with the returned `idempotency_key` and the same text and options.
+Both tools generate an idempotency key if you omit it. `detect_ai_text` returns it on `network_error`, when the request may already have used credits. `humanize_text` returns it with pending and finished tasks. It also returns the key if the network request fails or the API sends an error or invalid response.
 
 ## Disclosure
 

@@ -53,7 +53,7 @@ def _http_error(status, payload, retry_after):
     result = {
         "error": payload.get("error", "http_error"),
         "message": payload.get("message", f"AI Checker Humanizer returned HTTP {status}."),
-        "status": status,
+        "httpStatus": status,
     }
     for field in (
         "retryAfter", "creditsRemaining", "creditsNeeded", "maxWords", "maxUnits", "units",
@@ -101,10 +101,10 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
     return payload, retry_after
 
 
-def _task_path(task_id):
+def _normalize_task_id(task_id):
     if isinstance(task_id, str):
         try:
-            return f"/humanize/{UUID(task_id)}"
+            return str(UUID(task_id))
         except ValueError:
             pass
     return None
@@ -129,11 +129,11 @@ class Tools:
     def _submit(self, args, path, *, timeout, options=None):
         key, error = self._api_key()
         if error:
-            return key, error, None
+            return key, error, None, None
 
         text = args.get("text")
         if not isinstance(text, str) or not text.strip():
-            return key, _error("invalid_request", "Provide text to send."), None
+            return key, _error("invalid_request", "Provide text to send."), None, None
         idempotency_key = args.get("idempotency_key")
         if idempotency_key is not None and (
             not isinstance(idempotency_key, str)
@@ -144,47 +144,58 @@ class Tools:
         ):
             return key, _error(
                 "invalid_request", "Use 1 to 128 printable ASCII characters for idempotency_key."
-            ), None
+            ), None, None
+        if idempotency_key is None:
+            idempotency_key = str(uuid4())
 
         result, retry_after = _request(
             key, "POST", path, timeout=timeout, body={"text": text, **(options or {})},
             idempotency_key=idempotency_key,
         )
-        return key, result, retry_after
+        return key, result, retry_after, idempotency_key
 
     def detect_ai_text(self, args, **kwargs):
-        _, result, _ = self._submit(args, "/detect", timeout=60)
+        _, result, _, idempotency_key = self._submit(args, "/detect", timeout=60)
+        if result.get("error") == "network_error":
+            result["idempotency_key"] = idempotency_key
+            result["message"] = (
+                "The detection result is unknown and the request may have used credits. "
+                "Retry detect_ai_text within 24 hours. Use the returned idempotency_key "
+                "and the same text."
+            )
         return _json(result)
 
     def humanize_text(self, args, **kwargs):
         deadline = time.monotonic() + _HUMANIZE_WAIT
-        mode = args.get("mode", "standard")
-        strength = args.get("strength", "medium")
+        mode = args.get("mode")
+        strength = args.get("strength")
+        mode = "standard" if mode is None else mode
+        strength = "medium" if strength is None else strength
         if mode not in MODES or strength not in STRENGTHS:
             return _json(_error(
                 "invalid_request",
                 "Use mode standard, academic, casual or concise, and strength light, medium or heavy.",
             ))
 
-        idempotency_key = args.get("idempotency_key")
-        if idempotency_key is None:
-            idempotency_key = str(uuid4())
-        key, result, retry_after = self._submit(
-            {**args, "idempotency_key": idempotency_key}, "/humanize", timeout=_OTHER_TIMEOUT,
+        key, result, retry_after, idempotency_key = self._submit(
+            args, "/humanize", timeout=_OTHER_TIMEOUT,
             options={"mode": mode, "strength": strength},
         )
         if "error" in result:
-            if result["error"] == "network_error":
+            if idempotency_key is not None:
                 result["idempotency_key"] = idempotency_key
+            if result["error"] == "network_error":
                 result["message"] = (
-                    "Could not confirm the rewrite submission. Retry humanize_text with "
-                    "the same text, options, and returned idempotency_key."
+                    "Could not confirm the rewrite submission. Retry humanize_text within 24 hours. "
+                    "Use the returned idempotency_key and the same text and options."
                 )
             return _json(result)
-        task_id = result.get("taskId")
-        path = _task_path(task_id)
-        if path is None:
-            return _json(_error("invalid_response", "The rewrite response did not include a valid task ID."))
+        task_id = _normalize_task_id(result.get("taskId"))
+        if task_id is None:
+            result = _error("invalid_response", "The rewrite response did not include a valid task ID.")
+            result["idempotency_key"] = idempotency_key
+            return _json(result)
+        path = f"/humanize/{task_id}"
 
         while result.get("status") in _PENDING:
             pending = {
@@ -217,15 +228,14 @@ class Tools:
 
     def get_humanize_result(self, args, **kwargs):
         key, result = self._api_key()
-        task_id = args.get("task_id")
-        path = _task_path(task_id)
-        if path is None:
+        task_id = _normalize_task_id(args.get("task_id"))
+        if task_id is None:
             return _json(result or _error(
                 "invalid_request", "Provide the task ID returned by humanize_text.",
             ))
         if result is None:
-            result, _ = _request(key, "GET", path, timeout=_OTHER_TIMEOUT)
-        result.setdefault("taskId", task_id)
+            result, _ = _request(key, "GET", f"/humanize/{task_id}", timeout=_OTHER_TIMEOUT)
+        result["taskId"] = task_id
         return _json(result)
 
     def get_balance(self, args, **kwargs):

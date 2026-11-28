@@ -9,6 +9,7 @@ _IDEMPOTENCY_KEY = {
     "pattern": "^[ -~]+$",
     "description": "Reuse the same key, text, and options within 24 hours to avoid a second charge.",
 }
+_HTTP_ERROR = " HTTP errors include httpStatus."
 
 
 def register(ctx):
@@ -31,8 +32,11 @@ def register(ctx):
                 "Check up to 10,000 words for AI writing. Returns a 0–100 score and verdict "
                 "when available, or a reason if there is no verdict. English and Portuguese "
                 "can include sentence scores. Spanish and French get whole-text results. "
-                "Costs one credit per scored word only when there is a verdict. Reuse "
-                "the key with the same text within 24 hours to avoid a second charge."
+                "Costs one credit per scored word only when there is a verdict. The tool "
+                "generates an idempotency key if you omit it. If detection returns "
+                "network_error, the request may already have used credits. Retry with the returned "
+                "idempotency_key and the same text within 24 hours to avoid a second charge."
+                + _HTTP_ERROR
             ),
             "parameters": {
                 "type": "object",
@@ -55,12 +59,13 @@ def register(ctx):
                 "requests over 200 chunks. Returns the rewritten text when available. Polls "
                 "for up to 50 seconds. If the task is pending or a status check fails, use "
                 "the returned taskId with get_humanize_result. The tool generates an "
-                "idempotency_key if you omit it and returns the key when the API accepts "
-                "the rewrite. If submission returns network_error, retry with the returned "
-                "idempotency_key. Reusing the key with the same text and options within "
-                "24 hours avoids a second charge. "
+                "idempotency key if you omit it. It returns the key with pending and finished "
+                "tasks, API errors, network errors, and invalid responses. If you retry a failed "
+                "submission, reuse the returned idempotency_key with the same text and options "
+                "within 24 hours to avoid a second charge. "
                 "Each successfully rewritten chunk costs five credits per original word, "
                 "with a ten-word minimum per chunk."
+                + _HTTP_ERROR
             ),
             "parameters": {
                 "type": "object",
@@ -93,6 +98,7 @@ def register(ctx):
                 "Look up a rewrite by task ID. Returns the task status and any rewritten "
                 "text. Results are available for about 70 minutes after submission. "
                 "Looking up a task costs no credits."
+                + _HTTP_ERROR
             ),
             "parameters": {
                 "type": "object",
@@ -113,7 +119,7 @@ def register(ctx):
         handler=tools.get_balance,
         schema={
             "name": "get_balance",
-            "description": "Show remaining API credits and when they expire. This call is free.",
+            "description": "Show remaining API credits and when they expire. This call is free." + _HTTP_ERROR,
             "parameters": {"type": "object", "properties": {}},
         },
     )
