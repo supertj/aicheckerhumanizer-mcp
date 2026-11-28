@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-aicheckerhumanizer"
+dynamic = ["version"]
+description = "AI Checker Humanizer detection and rewriting tools for LangChain"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "langchain-core>=1.0,<2",
+    "httpx>=0.27,<1",
+    "pydantic>=2.7.4,<3",
+]
+
+[project.urls]
+Documentation = "https://aicheckerhumanizer.com/docs/api"
+Repository = "https://github.com/supertj/aicheckerhumanizer-mcp"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3,<10",
+    "pytest-asyncio>=1.3,<2",
+    "pytest-socket>=0.7,<1",
+    "respx>=0.23.1,<1",
+    "langchain-tests==1.1.9",
+    "ruff>=0.17,<1",
+    "mypy>=2.4,<3",
+]
+examples = ["langchain>=1.0,<2"]
+
+[tool.uv]
+exclude-newer = "2026-11-14T00:00:00Z"
+
+[tool.hatch.version]
+path = "langchain_aicheckerhumanizer/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_aicheckerhumanizer"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/uv.lock"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
