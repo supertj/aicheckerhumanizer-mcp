@@ -38,3 +38,21 @@ jobs:
       - run: uv sync --locked --group examples --python "${{ matrix.python-version }}"
       - run: make lint
       - run: make test
+
+  lowest-direct:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: langchain
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.10"
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          version: "0.12.21"
+      - run: uv sync --resolution lowest-direct --python 3.10
+      - run: uv run --no-sync pytest tests/unit_tests

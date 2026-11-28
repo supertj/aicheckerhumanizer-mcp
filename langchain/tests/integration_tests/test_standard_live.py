@@ -63,7 +63,9 @@ class TestHumanizeLive(_ToolsLive):
 
 @pytest.fixture(scope="session")
 def humanize_task_id() -> str:
-    task = AICheckerHumanizerAPIWrapper().humanize_start(_DRAFT)
+    task = AICheckerHumanizerAPIWrapper().humanize_start(
+        _DRAFT, idempotency_key=f"{TestHumanizeLive.__name__}-{_RUN_ID}"
+    )
     task_id: str = task["taskId"]
     return task_id
 

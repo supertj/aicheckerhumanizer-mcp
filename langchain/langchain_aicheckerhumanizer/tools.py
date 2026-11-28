@@ -9,6 +9,7 @@ from langchain_core.tools import BaseTool, BaseToolkit, ToolException
 from pydantic import BaseModel, Field
 
 from .api import (
+    _REQUEST_TIMEOUT_MESSAGE,
     AICheckerHumanizerAPIWrapper,
     AICheckerHumanizerError,
     HumanizeMode,
@@ -24,6 +25,7 @@ class _DetectInput(BaseModel):
     text: str = Field(description="Text to check, up to 10,000 words.")
     idempotency_key: str | None = Field(
         default=None,
+        min_length=1,
         max_length=128,
         pattern=r"^[ -~]*$",
         description=(
@@ -42,6 +44,7 @@ class _HumanizeInput(BaseModel):
     )
     idempotency_key: str | None = Field(
         default=None,
+        min_length=1,
         max_length=128,
         pattern=r"^[ -~]*$",
         description=(
@@ -52,7 +55,9 @@ class _HumanizeInput(BaseModel):
 
 
 class _GetResultInput(BaseModel):
-    task_id: str = Field(description="The taskId returned by the rewrite tool.")
+    task_id: str = Field(
+        min_length=1, description="The taskId returned by the rewrite tool."
+    )
 
 
 class AICheckerHumanizerDetectTool(BaseTool):
@@ -106,17 +111,22 @@ def _humanize_result(
             "Set task_id to the returned taskId. "
             "Results are available for about 70 minutes after submission."
         )
-        task = {
-            "taskId": task["taskId"],
-            "status": task["status"],
-            "message": message,
-        }
+        fields = ("taskId", "status", "retryAfter")
+        task = {field: task[field] for field in fields if field in task}
+        task["message"] = message
         if error is not None:
             task["error"] = error.code
             task["message"] = f"{error.message} {message}"
             if error.retry_after is not None:
                 task["retryAfter"] = error.retry_after
     return json.dumps(task, ensure_ascii=False)
+
+
+def _poll_error_result(task: dict[str, Any], error: AICheckerHumanizerError) -> str:
+    status = error.status
+    if status is None or status == 429 or 500 <= status < 600:
+        return _humanize_result(task, error)
+    raise ToolException(error.message) from error
 
 
 class AICheckerHumanizerHumanizeTool(BaseTool):
@@ -126,8 +136,9 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
     description: str = (
         "Rewrite up to 3,000 words. Choose standard, academic, casual or concise "
         "mode and light, medium or heavy strength. Defaults are standard and medium. "
-        "The API charges 5 credits per original word in each rewritten chunk "
-        "(minimum 10 words per chunk). Repeat the same text and options "
+        "The API charges 5 credits per original word for each chunk it rewrites "
+        "successfully. Chunks under 10 words are billed as 10. "
+        "Repeat the same text and options "
         "with the same idempotency_key within 24 hours to get the same task without "
         "another charge. Returns JSON with the rewritten text and any available "
         "scores, or a task ID and status if the rewrite is still pending."
@@ -167,7 +178,7 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                     task["taskId"], timeout=min(self.api_wrapper.timeout, remaining)
                 )
             except AICheckerHumanizerError as exc:
-                return _humanize_result(task, exc)
+                return _poll_error_result(task, exc)
         return _humanize_result(task)
 
     async def _arun(
@@ -199,9 +210,14 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
                     timeout=remaining,
                 )
             except asyncio.TimeoutError:
-                break
+                return _humanize_result(
+                    task,
+                    AICheckerHumanizerError(
+                        status=None, code="timeout", message=_REQUEST_TIMEOUT_MESSAGE
+                    ),
+                )
             except AICheckerHumanizerError as exc:
-                return _humanize_result(task, exc)
+                return _poll_error_result(task, exc)
         return _humanize_result(task)
 
 
