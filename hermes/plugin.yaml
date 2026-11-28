@@ -1,0 +1,12 @@
+name: aicheckerhumanizer
+title: AI Checker Humanizer
+version: "0.1.0"
+description: Check text for AI writing, rewrite it, and see your remaining API credits.
+author: AI Checker Humanizer
+requires_hermes: ">=0.17.0"
+requires_env: [AICHECKERHUMANIZER_API_KEY]
+provides_tools:
+  - detect_ai_text
+  - humanize_text
+  - get_humanize_result
+  - get_balance
