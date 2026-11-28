@@ -49,8 +49,8 @@ def clock(monkeypatch):
             self.seconds += delay
 
     fake = Clock()
-    monkeypatch.setattr(tools.time, "monotonic", lambda: fake.seconds)
-    monkeypatch.setattr(tools.time, "sleep", fake.sleep)
+    monkeypatch.setattr(tools, "monotonic", lambda: fake.seconds)
+    monkeypatch.setattr(tools, "sleep", fake.sleep)
     return fake
 
 
@@ -90,8 +90,7 @@ def test_detect_without_verdict(handlers, http):
     (OSError, "network_error", None),
     (response(502, b"<html>Bad Gateway</html>"), "http_error", 502),
     (response(503, {"error": "detection_unavailable"}), "detection_unavailable", 503),
-    (response(200, b"<html>Unexpected response</html>"), "invalid_response", None),
-    (response(200, {}), "invalid_response", None),
+    (response(409, {"error": "in_progress", "retryAfter": 3}), "in_progress", 409),
 ])
 def test_detect_uncertain_result_can_be_retried_with_same_key(handlers, http, key, failure, code, status):
     _, connection = http
@@ -111,7 +110,7 @@ def test_detect_uncertain_result_can_be_retried_with_same_key(handlers, http, ke
     assert result["error"] == code
     assert result.get("httpStatus") == status
     assert result["idempotency_key"] == submitted_key
-    if code in ("network_error", "invalid_response"):
+    if code == "network_error":
         assert "request may have used credits" in result["message"]
         assert "within 24 hours" in result["message"]
     assert connection.request.call_count == 1
@@ -123,18 +122,21 @@ def test_detect_uncertain_result_can_be_retried_with_same_key(handlers, http, ke
     assert first_post == second_post
 
 
-def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, clock):
+@pytest.mark.parametrize("skipped_words", [0, 12])
+def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, clock, skipped_words):
     connect, connection = http
     done = {"status": "completed", "output": "Rewritten text."}
     connection.getresponse.side_effect = [
-        response(202, {"taskId": _TASK_ID, "status": "queued"}, "4"),
+        response(202, {"taskId": _TASK_ID, "status": "queued", "skippedWords": skipped_words}, "4"),
         response(200, {"taskId": _TASK_ID, "status": "running"}),
         response(200, done),
     ]
 
     result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
 
-    assert json.loads(result) == {**done, "taskId": _TASK_ID, "idempotency_key": "rewrite-123"}
+    assert json.loads(result) == {
+        **done, "taskId": _TASK_ID, "idempotency_key": "rewrite-123", "skippedWords": skipped_words,
+    }
     assert clock.sleeps == [4, 2.5]
     assert [call.kwargs["timeout"] for call in connect.call_args_list] == [30, 30, 30]
     post, *polls = connection.request.call_args_list
@@ -174,10 +176,22 @@ def test_humanize_accepts_a_replayed_task_id_without_status(handlers, http, cloc
 
     result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
 
-    assert json.loads(result) == {**accepted, "status": "pending", "idempotency_key": "rewrite-123"}
+    assert json.loads(result) == {**accepted, **complete, "idempotency_key": "rewrite-123"}
+    assert clock.sleeps == []
+    assert [call.args for call in http[1].request.call_args_list] == [
+        ("POST", "/api/v1/humanize"), ("GET", f"/api/v1/humanize/{_TASK_ID}"),
+    ]
+
+
+def test_replay_without_status_respects_retry_after_and_budget(handlers, http, clock):
+    accepted = {"taskId": _TASK_ID, "replayed": True}
+    http[1].getresponse.side_effect = [response(202, accepted, "60")]
+
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {**accepted, "idempotency_key": "rewrite-123"}
     assert clock.sleeps == []
     assert http[1].request.call_count == 1
-    assert json.loads(handlers.get_humanize_result({"task_id": _TASK_ID})) == complete
 
 
 @pytest.mark.parametrize("key", [None, "rewrite-123"])
@@ -199,8 +213,8 @@ def test_humanize_submission_network_error_can_be_retried_with_same_key(handlers
     assert result == {
         "error": "network_error",
         "message": (
-            "Could not confirm the rewrite submission. Retry humanize_text within 24 hours. "
-            "Use the returned idempotency_key and the same text and options."
+            "Could not confirm the rewrite submission. To avoid a second charge, retry "
+            "humanize_text within 24 hours with the returned idempotency_key and the same text and options."
         ),
         "idempotency_key": submitted_key,
     }
@@ -241,8 +255,7 @@ def test_humanize_submission_html_gateway_error_can_be_retried_with_same_key(han
 @pytest.mark.parametrize(("status", "body", "error"), [
     (503, {"error": "capacity"}, "capacity"),
     (503, {"error": "unavailable"}, "unavailable"),
-    (202, b"<html>Unexpected response</html>", "invalid_response"),
-    (202, {"status": "queued"}, "invalid_response"),
+    (409, {"error": "in_progress", "retryAfter": 3}, "in_progress"),
 ])
 def test_humanize_submission_errors_keep_idempotency_key(handlers, http, status, body, error):
     http[1].getresponse.side_effect = [response(status, body)]
@@ -251,6 +264,25 @@ def test_humanize_submission_errors_keep_idempotency_key(handlers, http, status,
 
     assert result["error"] == error
     assert result["idempotency_key"] == "rewrite-123"
+    assert http[1].request.call_count == 1
+
+
+@pytest.mark.parametrize("handler", ["detect_ai_text", "humanize_text"])
+@pytest.mark.parametrize(("status", "body", "error"), [
+    (400, b"<html>Bad Request</html>", "http_error"),
+    (413, b"<html>Content Too Large</html>", "http_error"),
+    (409, {"error": "busy", "retryAfter": 3}, "busy"),
+    (202, b"<html>Unexpected response</html>", "invalid_response"),
+    (202, {"status": "queued"}, "invalid_response"),
+])
+def test_other_submission_errors_omit_retry_key(handlers, http, handler, status, body, error):
+    http[1].getresponse.side_effect = [response(status, body)]
+
+    result = json.loads(getattr(handlers, handler)({"text": "Example.", "idempotency_key": "request-123"}))
+
+    assert result["error"] == error
+    assert "idempotency_key" not in result
+    assert "same text" not in result["message"]
     assert http[1].request.call_count == 1
 
 
@@ -270,7 +302,7 @@ def test_humanize_timeout_caps_poll_from_post_start(handlers, http, clock):
 
     def exchange():
         clock.seconds += 29
-        yield response(202, {"taskId": _TASK_ID, "status": "queued"})
+        yield response(202, {"taskId": _TASK_ID, "status": "queued", "skippedWords": 0})
         yield response(200, {"taskId": _TASK_ID, "status": "running"})
         clock.seconds += connect.call_args.kwargs["timeout"]
         raise TimeoutError
@@ -282,6 +314,7 @@ def test_humanize_timeout_caps_poll_from_post_start(handlers, http, clock):
     assert json.loads(result) == {
         "taskId": _TASK_ID,
         "status": "running",
+        "skippedWords": 0,
         "idempotency_key": connection.request.call_args_list[0].kwargs["headers"]["Idempotency-Key"],
     }
     assert [call.kwargs["timeout"] for call in connect.call_args_list] == [30, 18.5, 16]
@@ -289,7 +322,7 @@ def test_humanize_timeout_caps_poll_from_post_start(handlers, http, clock):
 
 
 def test_humanize_returns_pending_when_retry_after_exceeds_budget(handlers, http, clock):
-    payload = {"taskId": _TASK_ID, "status": "queued"}
+    payload = {"taskId": _TASK_ID, "status": "queued", "skippedWords": 12}
     http[1].getresponse.side_effect = [response(202, payload, "60")]
 
     result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
@@ -316,7 +349,10 @@ def test_expired_task_keeps_status_charge_and_expiration(handlers, http, clock, 
         "message": "The result has expired.",
         "taskId": _TASK_ID,
         "status": status,
+        "reason": "not_humanized",
+        "creditsReserved": 75,
         "creditsCharged": 50,
+        "expiresAt": "2027-01-23T00:00:00Z",
         "expiredAt": "2027-01-23T00:00:00Z",
     }
     replies = [response(410, payload)]
@@ -332,6 +368,25 @@ def test_expired_task_keeps_status_charge_and_expiration(handlers, http, clock, 
         result = handlers.get_humanize_result({"task_id": _TASK_ID})
 
     assert json.loads(result) == expected
+
+
+def test_expired_replay_is_returned_as_gone_without_polling(handlers, http, clock):
+    payload = {
+        "error": "result_expired",
+        "message": "The result has expired.",
+        "taskId": UUID(_TASK_ID).hex.upper(),
+        "replayed": True,
+        "status": "running",
+        "creditsReserved": 75,
+        "expiresAt": "2027-01-23T00:00:00Z",
+    }
+    http[1].getresponse.side_effect = [response(202, payload)]
+
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {**payload, "taskId": _TASK_ID, "httpStatus": 410, "taskStatus": "running"}
+    assert clock.sleeps == []
+    assert http[1].request.call_count == 1
 
 
 @pytest.mark.parametrize("task_id", [_TASK_ID, f"{{{_TASK_ID}}}", f"urn:uuid:{_TASK_ID}", UUID(_TASK_ID).hex])
@@ -358,20 +413,21 @@ def test_get_balance(handlers, http):
 
 
 @pytest.mark.parametrize(("status", "code", "fields"), [
-    (400, "bad_request", {}),
+    (400, "bad_request", {"field": "text"}),
     (401, "unauthorized", {}),
     (402, "insufficient_credits", {"creditsRemaining": 0, "creditsNeeded": 200}),
     (402, "trial_paused", {}),
     (404, "not_found", {}),
     (409, "in_progress", {"retryAfter": 3}),
     (409, "busy", {"retryAfter": 4}),
-    (413, "too_long", {"maxWords": 10_000}),
+    (413, "too_long", {"maxWords": 10_000, "words": 10_001, "chars": 60_175}),
+    (413, "too_long", {"maxWords": 10_000, "maxChars": 100_000}),
     (413, "too_many_units", {"maxUnits": 200, "units": 201}),
     (422, "language_unsupported", {}),
     (422, "mode_unavailable", {}),
     (422, "nothing_to_rewrite", {}),
     (422, "idempotency_conflict", {}),
-    (429, "rate_limited", {"retryAfter": 10}),
+    (429, "rate_limited", {"retryAfter": 10, "reason": "too_many_concurrent"}),
     (429, "api_paused", {"retryAfter": 10}),
     (503, "capacity", {"retryAfter": 20}),
     (503, "detection_unavailable", {"retryAfter": 20}),
@@ -383,12 +439,15 @@ def test_http_error_keeps_code_message_and_fields(handlers, http, status, code, 
 
     result = handlers.detect_ai_text({"text": "Check this.", "idempotency_key": "detect-123"})
 
-    assert json.loads(result) == {**payload, "httpStatus": status, "idempotency_key": "detect-123"}
+    expected = {**payload, "httpStatus": status}
+    if status >= 500 or code == "in_progress":
+        expected["idempotency_key"] = "detect-123"
+    assert json.loads(result) == expected
     assert http[1].request.call_count == 1
 
 
 def test_http_error_falls_back_to_retry_after_date(handlers, http, monkeypatch):
-    monkeypatch.setattr(tools.time, "time", lambda: 1000)
+    monkeypatch.setattr(tools, "time", lambda: 1000)
     date = format_datetime(datetime.fromtimestamp(1020, UTC), usegmt=True)
     http[1].getresponse.side_effect = [response(503, b"<html>", date)]
 
@@ -413,18 +472,22 @@ def test_redirect_is_an_http_error(handlers, http):
     assert http[1].request.call_count == 1
 
 
-def test_poll_error_is_returned_without_retry(handlers, http, clock):
+@pytest.mark.parametrize(("status", "error", "retry_after"), [
+    (401, "unauthorized", None), (404, "not_found", None), (429, "rate_limited", "6"),
+])
+def test_poll_error_is_returned_without_retry(handlers, http, clock, status, error, retry_after):
+    payload = {"error": error, "message": "Service detail."}
     http[1].getresponse.side_effect = [
         response(202, {"taskId": _TASK_ID, "status": "running"}),
-        response(429, {"error": "rate_limited", "message": "Slow down."}, "6"),
+        response(status, payload, retry_after),
     ]
 
     result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
 
-    assert json.loads(result) == {
-        "error": "rate_limited", "message": "Slow down.", "httpStatus": 429, "retryAfter": 6,
-        "taskId": _TASK_ID, "idempotency_key": "rewrite-123",
-    }
+    expected = {**payload, "httpStatus": status, "taskId": _TASK_ID, "idempotency_key": "rewrite-123"}
+    if retry_after:
+        expected["retryAfter"] = 6
+    assert json.loads(result) == expected
     assert clock.sleeps == [2.5]
     assert http[1].request.call_count == 2
 

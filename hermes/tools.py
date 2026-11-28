@@ -3,12 +3,12 @@
 import json
 import math
 import re
-import time
 from contextlib import closing
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException, HTTPSConnection
 from sys import get_int_max_str_digits
+from time import monotonic, sleep, time
 from uuid import UUID, uuid4
 
 API_KEY_NAME = "AICHECKERHUMANIZER_API_KEY"
@@ -51,26 +51,24 @@ def _retry_after(header):
         when = parsedate_to_datetime(header)
         if when.tzinfo is None:
             when = when.replace(tzinfo=UTC)
-        return max(0, math.ceil(when.timestamp() - time.time()))
+        return max(0, math.ceil(when.timestamp() - time()))
     except (ValueError, OverflowError, OSError):
         return None
 
 
 def _http_error(status, payload, retry_after):
     result = {
-        "error": payload.get("error", "http_error"),
-        "message": payload.get("message", f"AI Checker Humanizer returned HTTP {status}."),
+        "error": "http_error",
+        "message": f"AI Checker Humanizer returned HTTP {status}.",
+        **payload,
         "httpStatus": status,
     }
-    for field in (
-        "retryAfter", "creditsRemaining", "creditsNeeded", "maxWords", "maxUnits", "units",
-        "taskId", "taskStatus", "creditsCharged", "expiredAt",
-    ):
-        if field in payload:
-            result[field] = payload[field]
-    if status == 410 and isinstance(payload.get("status"), str):
-        result["status"] = payload["status"]
-        result.setdefault("taskStatus", payload["status"])
+    if status == 410:
+        if isinstance(result.get("status"), str):
+            result.setdefault("taskStatus", result["status"])
+        task_id = _normalize_task_id(result.get("taskId"))
+        if task_id is not None:
+            result["taskId"] = task_id
     if retry_after is not None:
         result.setdefault("retryAfter", retry_after)
     return result
@@ -102,6 +100,9 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
     except (OSError, HTTPException):
         return _error("network_error", "Could not reach AI Checker Humanizer."), None
 
+    # A replay can wrap the expired task view in HTTP 202.
+    if status == 202 and isinstance(payload, dict) and payload.get("error") == "result_expired":
+        status = 410
     if not 200 <= status < 300:
         return _http_error(status, payload if isinstance(payload, dict) else {}, retry_after), None
     if not isinstance(payload, dict):
@@ -123,6 +124,15 @@ def _normalize_task_id(task_id):
         except ValueError:
             pass
     return None
+
+
+def _keep_retry_key(result, idempotency_key):
+    status = result.get("httpStatus")
+    if idempotency_key is not None and (
+        result.get("error") in ("network_error", "in_progress")
+        or (isinstance(status, int) and 500 <= status < 600)
+    ):
+        result["idempotency_key"] = idempotency_key
 
 
 class Tools:
@@ -178,18 +188,18 @@ class Tools:
         _, result, _, idempotency_key = self._submit(args, "/detect", timeout=_DETECT_TIMEOUT)
         if "error" not in result and not {"score", "verdict"} <= result.keys():
             result = _error("invalid_response", "AI Checker Humanizer returned an invalid response.")
-        if result.get("error") in ("network_error", "invalid_response"):
+        if result.get("error") == "network_error":
             result["message"] = (
                 "The detection result is unknown and the request may have used credits. "
                 "To avoid a second charge, retry detect_ai_text within 24 hours with the returned "
                 "idempotency_key and the same text."
             )
-        if "error" in result and idempotency_key is not None:
-            result["idempotency_key"] = idempotency_key
+        if "error" in result:
+            _keep_retry_key(result, idempotency_key)
         return _json(result)
 
     def humanize_text(self, args, **kwargs):
-        deadline = time.monotonic() + _HUMANIZE_WAIT
+        deadline = monotonic() + _HUMANIZE_WAIT
         mode = args.get("mode")
         strength = args.get("strength")
         mode = "standard" if mode is None else mode
@@ -205,49 +215,48 @@ class Tools:
             options={"mode": mode, "strength": strength},
         )
         if "error" in result:
-            if idempotency_key is not None:
-                result["idempotency_key"] = idempotency_key
+            _keep_retry_key(result, idempotency_key)
             if result["error"] == "network_error":
                 result["message"] = (
-                    "Could not confirm the rewrite submission. Retry humanize_text within 24 hours. "
-                    "Use the returned idempotency_key and the same text and options."
+                    "Could not confirm the rewrite submission. To avoid a second charge, retry "
+                    "humanize_text within 24 hours with the returned idempotency_key and the same text and options."
                 )
             return _json(result)
         task_id = _normalize_task_id(result.get("taskId"))
         if task_id is None:
-            result = _error("invalid_response", "The rewrite response did not include a valid task ID.")
-            result["idempotency_key"] = idempotency_key
-            return _json(result)
-        # An accepted replay can include a task ID before its current status is available.
-        if not isinstance(result.get("status"), str):
-            result["status"] = "pending"
+            return _json(_error("invalid_response", "The rewrite response did not include a valid task ID."))
 
-        while "error" not in result and result.get("status") in _PENDING:
-            pending = {
-                "taskId": task_id,
-                "status": result["status"],
-                "idempotency_key": idempotency_key,
-            }
-            # Retry-After is a minimum. Keep the normal interval to avoid rapid polling.
-            delay = max(_POLL_INTERVAL, retry_after or 0)
-            if delay >= deadline - time.monotonic():
+        task_info = {"taskId": task_id, "idempotency_key": idempotency_key}
+        # The task lookup does not repeat these submission fields.
+        for field in ("skippedWords", "replayed"):
+            if field in result:
+                task_info[field] = result[field]
+        while "error" not in result:
+            status = result.get("status")
+            pending = dict(task_info)
+            if isinstance(status, str):
+                if status not in _PENDING:
+                    break
+                pending["status"] = status
+            # A replay without a status can be checked immediately unless Retry-After says to wait.
+            delay = max(_POLL_INTERVAL if "status" in pending else 0, retry_after or 0)
+            if delay >= deadline - monotonic():
                 return _json(pending)
-            time.sleep(delay)
-            remaining = deadline - time.monotonic()
+            if delay:
+                sleep(delay)
+            remaining = deadline - monotonic()
             if remaining <= 0:
                 return _json(pending)
             result, retry_after = _get_task(key, task_id, timeout=min(_OTHER_TIMEOUT, remaining))
             if result.get("error") == "network_error":
-                if time.monotonic() < deadline:
+                if monotonic() < deadline:
                     pending["error"] = result["error"]
                     pending["message"] = (
                         "Could not check the rewrite status. Use taskId with get_humanize_result."
                     )
                 return _json(pending)
 
-        result["taskId"] = task_id
-        result["idempotency_key"] = idempotency_key
-        return _json(result)
+        return _json({**result, **task_info})
 
     def get_humanize_result(self, args, **kwargs):
         key, result = self._api_key()

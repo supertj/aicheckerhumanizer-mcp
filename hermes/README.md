@@ -26,11 +26,13 @@ hermes plugins install 'https://github.com/supertj/aicheckerhumanizer-mcp#hermes
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `detect_ai_text` | `text` up to 10,000 words. Optional `idempotency_key`. | A 0–100 score and verdict when available, or a reason if there's no verdict. English and Portuguese can include sentence scores. Spanish and French get whole-text results. |
-| `humanize_text` | `text` up to 3,000 words. The API splits the text into chunks and rejects requests over 200 chunks. Optional `mode` (`standard`, `academic`, `casual`, `concise`), `strength` (`light`, `medium`, `heavy`), and `idempotency_key`. Defaults are `standard` and `medium`. | The rewritten text when available. If the rewrite is still in progress, its status is unknown, or a status check fails, pass the returned `taskId` to `get_humanize_result`. |
+| `humanize_text` | `text` up to 3,000 words. The API splits the text into chunks and rejects requests over 200 chunks. Optional `mode` (`standard`, `academic`, `casual`, `concise`), `strength` (`light`, `medium`, `heavy`), and `idempotency_key`. Defaults are `standard` and `medium`. | The rewritten text when available. If the rewrite is still in progress or its status is unavailable, pass the returned `taskId` to `get_humanize_result`. |
 | `get_humanize_result` | `task_id` from `humanize_text`. | The task status and any rewritten text. The result is available for about 70 minutes after submission. |
 | `get_balance` | None. | Remaining credits and when each batch expires. |
 
-HTTP errors include the response code in `httpStatus`. An expired rewrite (HTTP 410) can include `creditsCharged`, `expiredAt`, and the task state in both `status` and `taskStatus`. See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields and error codes.
+`humanize_text` waits up to about 50 seconds for the rewrite. It returns `skippedWords` in pending and finished responses if the API provided the count on submission. The count covers words left unchanged because the selected mode doesn't support their language.
+
+HTTP errors include `httpStatus`. For an expired rewrite, both `get_humanize_result` and a replay of the original submission return `httpStatus: 410`. The error can include `creditsCharged`, `expiredAt`, and the last task status in both `status` and `taskStatus`. See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields and error codes.
 
 ## Credits
 
@@ -40,7 +42,7 @@ At $10 for 250,000 Starter credits, 1,000 scored words cost $0.04 and 1,000 bill
 
 The plugin uses the same API key and credit balance as REST and the hosted MCP server. To avoid a second charge, reuse the `idempotency_key` with the same text and options within 24 hours. Use 1 to 128 visible ASCII characters (`!` through `~`). When you reuse the key, detection returns the saved result and a rewrite returns the original task ID.
 
-Both tools generate an idempotency key if you omit it. They return the key if a submission fails, including when a request times out or the API returns an error or invalid response. `humanize_text` also returns the key with pending and finished tasks.
+`detect_ai_text` and `humanize_text` generate an idempotency key if you omit it. Submission errors include the key for network failures, 5xx responses, and `in_progress` errors. `humanize_text` also returns it with successful submissions.
 
 ## Disclosure
 

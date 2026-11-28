@@ -39,8 +39,8 @@ def register(ctx):
                 "when available, or a reason if there is no verdict. English and Portuguese "
                 "can include sentence scores. Spanish and French get whole-text results. "
                 "Costs one credit per scored word only when there is a verdict. The tool "
-                "generates an idempotency key if you omit it. It returns the key on network or "
-                "API errors and when the response is invalid. If you retry, use the returned "
+                "generates an idempotency key if you omit it. It returns the key on network "
+                "errors, 5xx responses, and in_progress errors. If you retry, use the returned "
                 "idempotency_key and the same text within 24 hours to avoid a second charge."
                 + _HTTP_ERROR
             ),
@@ -63,13 +63,14 @@ def register(ctx):
             "description": (
                 "Rewrite up to 3,000 words. The API splits the text into chunks and rejects "
                 "requests over 200 chunks. Waits up to about 50 seconds for the rewritten text. "
-                "If the API accepts the request without a status, the tool returns the task ID immediately. "
-                "Use the returned taskId with get_humanize_result if the status is queued, running, "
-                "or pending, or if a status check fails. The tool generates an "
-                "idempotency key if you omit it. It returns the key with pending and finished "
-                "tasks, API errors, network errors, and invalid responses. If you retry a failed "
-                "submission, reuse the returned idempotency_key with the same text and options "
-                "within 24 hours to avoid a second charge. "
+                "Use taskId with get_humanize_result if the task is still in progress or its "
+                "status is unavailable. When present, skippedWords counts words left unchanged "
+                "because the selected mode doesn't support their language. The tool generates an idempotency "
+                "key if you omit it. It returns the key with successful submissions and when "
+                "submission fails with a network error, a 5xx response, or an in_progress error. "
+                "If you retry, reuse the returned idempotency_key with the same text and "
+                "options within 24 hours to avoid a second charge. Replaying a submission for an expired "
+                "rewrite returns httpStatus 410. "
                 "Each successfully rewritten chunk costs five credits per original word, "
                 "with a ten-word minimum per chunk."
                 + _HTTP_ERROR
