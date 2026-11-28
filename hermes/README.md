@@ -26,7 +26,7 @@ hermes plugins install 'https://github.com/supertj/aicheckerhumanizer-mcp#hermes
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `detect_ai_text` | `text` up to 10,000 words. Optional `idempotency_key`. | A 0–100 score and verdict when available, or a reason if there's no verdict. English and Portuguese can include sentence scores. Spanish and French get whole-text results. |
-| `humanize_text` | `text` up to 3,000 words. The API splits the text into chunks and rejects requests over 200 chunks. Optional `mode` (`standard`, `academic`, `casual`, `concise`), `strength` (`light`, `medium`, `heavy`), and `idempotency_key`. Defaults are `standard` and `medium`. | The rewrite if it's ready within 50 seconds. If the task is still running, pass the returned `taskId` to `get_humanize_result`. |
+| `humanize_text` | `text` up to 3,000 words. The API splits the text into chunks and rejects requests over 200 chunks. Optional `mode` (`standard`, `academic`, `casual`, `concise`), `strength` (`light`, `medium`, `heavy`), and `idempotency_key`. Defaults are `standard` and `medium`. | The rewrite if it's ready within 50 seconds. If the task is pending or a status check fails, pass the returned `taskId` to `get_humanize_result`. |
 | `get_humanize_result` | `task_id` from `humanize_text`. | The task status and any rewritten text. The result is available for about 70 minutes after submission. |
 | `get_balance` | None. | Remaining credits and when each batch expires. |
 
@@ -38,7 +38,9 @@ Detection costs one credit per scored word when there's a verdict. Each successf
 
 At $10 for 250,000 Starter credits, 1,000 scored words cost $0.04 and 1,000 billable rewrite words cost $0.20. Larger packs give more credits per dollar. Purchased credits expire after 365 days. Eligible accounts get 5,000 trial credits for 30 days when they create their first API key. The trial requires a verified, non-disposable email address and is available once per account and email address.
 
-The plugin uses the same API key and credit balance as REST and the hosted MCP server. To avoid a second charge, replay the same text and options with the same `idempotency_key` within 24 hours. The key must be at most 128 printable ASCII characters. A detection replay returns the saved result, and a rewrite replay returns the original task ID.
+The plugin uses the same API key and credit balance as REST and the hosted MCP server. To avoid a second charge, reuse the `idempotency_key` with the same text and options within 24 hours. The key must be 1 to 128 printable ASCII characters. When you reuse the key, detection returns the saved result and a rewrite returns the original task ID.
+
+`humanize_text` generates an idempotency key if you omit it and returns the key when the API accepts the rewrite. If submission returns `network_error`, call `humanize_text` again with the returned `idempotency_key` and the same text and options.
 
 ## Disclosure
 

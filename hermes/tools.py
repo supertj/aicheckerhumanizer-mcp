@@ -7,7 +7,8 @@ from contextlib import closing
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from http.client import HTTPException, HTTPSConnection
-from uuid import UUID
+from sys import get_int_max_str_digits
+from uuid import UUID, uuid4
 
 API_KEY_NAME = "AICHECKERHUMANIZER_API_KEY"
 MODES = ("standard", "academic", "casual", "concise")
@@ -35,10 +36,10 @@ def _retry_after(header):
         return None
     header = header.strip()
     if header.isascii() and header.isdecimal():
-        try:
-            return int(header)
-        except ValueError:
+        limit = get_int_max_str_digits()
+        if limit and len(header) > limit:
             return None
+        return int(header)
     try:
         when = parsedate_to_datetime(header)
         if when.tzinfo is None:
@@ -165,11 +166,20 @@ class Tools:
                 "Use mode standard, academic, casual or concise, and strength light, medium or heavy.",
             ))
 
+        idempotency_key = args.get("idempotency_key")
+        if idempotency_key is None:
+            idempotency_key = str(uuid4())
         key, result, retry_after = self._submit(
-            args, "/humanize", timeout=_OTHER_TIMEOUT,
+            {**args, "idempotency_key": idempotency_key}, "/humanize", timeout=_OTHER_TIMEOUT,
             options={"mode": mode, "strength": strength},
         )
         if "error" in result:
+            if result["error"] == "network_error":
+                result["idempotency_key"] = idempotency_key
+                result["message"] = (
+                    "Could not confirm the rewrite submission. Retry humanize_text with "
+                    "the same text, options, and returned idempotency_key."
+                )
             return _json(result)
         task_id = result.get("taskId")
         path = _task_path(task_id)
@@ -177,7 +187,11 @@ class Tools:
             return _json(_error("invalid_response", "The rewrite response did not include a valid task ID."))
 
         while result.get("status") in _PENDING:
-            pending = {"taskId": task_id, "status": result["status"]}
+            pending = {
+                "taskId": task_id,
+                "status": result["status"],
+                "idempotency_key": idempotency_key,
+            }
             # Retry-After is a minimum. Keep the normal interval to avoid rapid polling.
             delay = max(_POLL_INTERVAL, retry_after or 0)
             if delay >= deadline - time.monotonic():
@@ -189,21 +203,29 @@ class Tools:
             result, retry_after = _request(
                 key, "GET", path, timeout=min(_OTHER_TIMEOUT, remaining),
             )
-            if result.get("error") == "network_error" and time.monotonic() >= deadline:
+            if result.get("error") == "network_error":
+                if time.monotonic() < deadline:
+                    pending["error"] = result["error"]
+                    pending["message"] = (
+                        "Could not check the rewrite status. Use taskId with get_humanize_result."
+                    )
                 return _json(pending)
 
-        if "error" not in result:
-            result.setdefault("taskId", task_id)
+        result["taskId"] = task_id
+        result["idempotency_key"] = idempotency_key
         return _json(result)
 
     def get_humanize_result(self, args, **kwargs):
-        key, error = self._api_key()
-        if error:
-            return _json(error)
-        path = _task_path(args.get("task_id"))
+        key, result = self._api_key()
+        task_id = args.get("task_id")
+        path = _task_path(task_id)
         if path is None:
-            return _json(_error("invalid_request", "Provide the task ID returned by humanize_text."))
-        result, _ = _request(key, "GET", path, timeout=_OTHER_TIMEOUT)
+            return _json(result or _error(
+                "invalid_request", "Provide the task ID returned by humanize_text.",
+            ))
+        if result is None:
+            result, _ = _request(key, "GET", path, timeout=_OTHER_TIMEOUT)
+        result.setdefault("taskId", task_id)
         return _json(result)
 
     def get_balance(self, args, **kwargs):

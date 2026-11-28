@@ -31,8 +31,8 @@ def register(ctx):
                 "Check up to 10,000 words for AI writing. Returns a 0–100 score and verdict "
                 "when available, or a reason if there is no verdict. English and Portuguese "
                 "can include sentence scores. Spanish and French get whole-text results. "
-                "Costs one credit per scored word only when there is a verdict. Replaying "
-                "the same text and idempotency key within 24 hours won't charge you again."
+                "Costs one credit per scored word only when there is a verdict. Reuse "
+                "the key with the same text within 24 hours to avoid a second charge."
             ),
             "parameters": {
                 "type": "object",
@@ -52,12 +52,15 @@ def register(ctx):
             "name": "humanize_text",
             "description": (
                 "Rewrite up to 3,000 words. The API splits the text into chunks and rejects "
-                "requests over 200 chunks. Returns the rewritten text when available. If the "
-                "task is still running after the wait of up to 50 seconds, use its taskId with "
-                "get_humanize_result. Each successfully rewritten chunk costs five "
-                "credits per original word, with a ten-word minimum per chunk. Replaying "
-                "the same text, options, and idempotency key within 24 hours won't charge "
-                "you again."
+                "requests over 200 chunks. Returns the rewritten text when available. Polls "
+                "for up to 50 seconds. If the task is pending or a status check fails, use "
+                "the returned taskId with get_humanize_result. The tool generates an "
+                "idempotency_key if you omit it and returns the key when the API accepts "
+                "the rewrite. If submission returns network_error, retry with the returned "
+                "idempotency_key. Reusing the key with the same text and options within "
+                "24 hours avoids a second charge. "
+                "Each successfully rewritten chunk costs five credits per original word, "
+                "with a ten-word minimum per chunk."
             ),
             "parameters": {
                 "type": "object",

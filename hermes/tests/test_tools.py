@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from email.utils import format_datetime
 from unittest.mock import MagicMock, Mock
+from uuid import UUID
 
 import pytest
 
@@ -78,11 +79,12 @@ def test_detect_without_verdict(handlers, http):
     http[1].getresponse.side_effect = [response(200, payload)]
 
     assert json.loads(handlers.detect_ai_text({"text": "Short text."})) == payload
+    assert "Idempotency-Key" not in http[1].request.call_args.kwargs["headers"]
 
 
 def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, clock):
     connect, connection = http
-    done = {"taskId": _TASK_ID, "status": "completed", "output": "Rewritten text."}
+    done = {"status": "completed", "output": "Rewritten text."}
     connection.getresponse.side_effect = [
         response(202, {"taskId": _TASK_ID, "status": "queued"}, "4"),
         response(200, {"taskId": _TASK_ID, "status": "running"}),
@@ -91,7 +93,7 @@ def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, 
 
     result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
 
-    assert json.loads(result) == done
+    assert json.loads(result) == {**done, "taskId": _TASK_ID, "idempotency_key": "rewrite-123"}
     assert clock.sleeps == [4, 2.5]
     assert [call.kwargs["timeout"] for call in connect.call_args_list] == [30, 30, 30]
     post, *polls = connection.request.call_args_list
@@ -113,12 +115,48 @@ def test_humanize_returns_terminal_post_without_polling(handlers, http, clock, s
 
     result = handlers.humanize_text({"text": "Rewrite this.", "mode": "academic", "strength": "heavy"})
 
-    assert json.loads(result) == payload
+    post = http[1].request.call_args
+    idempotency_key = post.kwargs["headers"]["Idempotency-Key"]
+    assert UUID(idempotency_key).version == 4
+    assert json.loads(result) == {**payload, "idempotency_key": idempotency_key}
     assert clock.sleeps == []
     assert http[1].request.call_count == 1
-    assert json.loads(http[1].request.call_args.kwargs["body"]) == {
+    assert json.loads(post.kwargs["body"]) == {
         "text": "Rewrite this.", "mode": "academic", "strength": "heavy",
     }
+
+
+@pytest.mark.parametrize("key", [None, "rewrite-123"])
+def test_humanize_submission_network_error_can_be_retried_with_same_key(handlers, http, clock, key):
+    _, connection = http
+    accepted = {"taskId": _TASK_ID, "status": "queued"}
+    connection.getresponse.side_effect = [TimeoutError, response(202, accepted, "60")]
+    args = {"text": "Rewrite this.", "mode": "casual", "strength": "light"}
+    if key is not None:
+        args["idempotency_key"] = key
+
+    result = json.loads(handlers.humanize_text(args))
+
+    submitted_key = connection.request.call_args.kwargs["headers"]["Idempotency-Key"]
+    if key is None:
+        assert UUID(submitted_key).version == 4
+    else:
+        assert submitted_key == key
+    assert result == {
+        "error": "network_error",
+        "message": (
+            "Could not confirm the rewrite submission. Retry humanize_text with "
+            "the same text, options, and returned idempotency_key."
+        ),
+        "idempotency_key": submitted_key,
+    }
+    assert connection.request.call_count == 1
+
+    retry = handlers.humanize_text({**args, "idempotency_key": result["idempotency_key"]})
+
+    assert json.loads(retry) == {**accepted, "idempotency_key": submitted_key}
+    first_post, second_post = connection.request.call_args_list
+    assert first_post == second_post
 
 
 def test_humanize_timeout_caps_poll_from_post_start(handlers, http, clock):
@@ -135,7 +173,11 @@ def test_humanize_timeout_caps_poll_from_post_start(handlers, http, clock):
 
     result = handlers.humanize_text({"text": "Rewrite this."})
 
-    assert json.loads(result) == {"taskId": _TASK_ID, "status": "running"}
+    assert json.loads(result) == {
+        "taskId": _TASK_ID,
+        "status": "running",
+        "idempotency_key": connection.request.call_args_list[0].kwargs["headers"]["Idempotency-Key"],
+    }
     assert [call.kwargs["timeout"] for call in connect.call_args_list] == [30, 18.5, 16]
     assert clock.seconds == 50
 
@@ -144,7 +186,9 @@ def test_humanize_returns_pending_when_retry_after_exceeds_budget(handlers, http
     payload = {"taskId": _TASK_ID, "status": "queued"}
     http[1].getresponse.side_effect = [response(202, payload, "60")]
 
-    assert json.loads(handlers.humanize_text({"text": "Rewrite this."})) == payload
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {**payload, "idempotency_key": "rewrite-123"}
     assert clock.sleeps == []
     assert http[1].request.call_count == 1
 
@@ -157,6 +201,17 @@ def test_get_task(handlers, http):
     assert json.loads(handlers.get_humanize_result({"task_id": _TASK_ID})) == payload
     assert connection.request.call_args.args == ("GET", f"/api/v1/humanize/{_TASK_ID}")
     connect.assert_called_once_with("aicheckerhumanizer.com", timeout=30)
+
+
+def test_get_task_network_error_keeps_task_id(handlers, http):
+    http[1].getresponse.side_effect = TimeoutError
+
+    assert json.loads(handlers.get_humanize_result({"task_id": _TASK_ID})) == {
+        "taskId": _TASK_ID,
+        "error": "network_error",
+        "message": "Could not reach AI Checker Humanizer.",
+    }
+    assert http[1].request.call_count == 1
 
 
 def test_get_balance(handlers, http):
@@ -215,6 +270,12 @@ def test_http_error_falls_back_to_retry_after_date(handlers, http, monkeypatch):
     }
 
 
+def test_retry_after_ignores_number_above_python_digit_limit(monkeypatch):
+    monkeypatch.setattr(tools, "get_int_max_str_digits", lambda: 4300)
+
+    assert tools._retry_after("9" * 4301) is None
+
+
 def test_redirect_is_an_http_error(handlers, http):
     http[1].getresponse.side_effect = [response(307, b"")]
 
@@ -228,11 +289,34 @@ def test_poll_error_is_returned_without_retry(handlers, http, clock):
         response(429, {"error": "rate_limited", "message": "Slow down."}, "6"),
     ]
 
-    assert json.loads(handlers.humanize_text({"text": "Rewrite this."})) == {
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {
         "error": "rate_limited", "message": "Slow down.", "status": 429, "retryAfter": 6,
+        "taskId": _TASK_ID, "idempotency_key": "rewrite-123",
     }
     assert clock.sleeps == [2.5]
     assert http[1].request.call_count == 2
+
+
+def test_poll_network_error_before_deadline_returns_pending_task(handlers, http, clock):
+    http[1].getresponse.side_effect = [
+        response(202, {"taskId": _TASK_ID, "status": "queued"}),
+        response(200, {"status": "running"}),
+        TimeoutError,
+    ]
+
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {
+        "taskId": _TASK_ID,
+        "status": "running",
+        "error": "network_error",
+        "message": "Could not check the rewrite status. Use taskId with get_humanize_result.",
+        "idempotency_key": "rewrite-123",
+    }
+    assert clock.sleeps == [2.5, 2.5]
+    assert http[1].request.call_count == 3
 
 
 @pytest.mark.parametrize("failure", [TimeoutError, OSError, tools.HTTPException])
@@ -275,6 +359,16 @@ def test_missing_api_key(handler, arguments, http):
     assert result["error"] == "missing_api_key"
     assert "AICHECKERHUMANIZER_API_KEY" in result["message"]
     assert "https://aicheckerhumanizer.com/account#api" in result["message"]
+    if "task_id" in arguments:
+        assert result["taskId"] == arguments["task_id"]
+    http[0].assert_not_called()
+
+
+@pytest.mark.parametrize("options", [{"mode": "formal"}, {"strength": "high"}])
+def test_invalid_humanize_options_cannot_reach_http(handlers, http, options):
+    result = handlers.humanize_text({"text": "Rewrite this.", **options})
+
+    assert json.loads(result)["error"] == "invalid_request"
     http[0].assert_not_called()
 
 
