@@ -87,6 +87,7 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
         headers["Idempotency-Key"] = idempotency_key
 
     # A direct HTTPS connection never follows redirects with the key or text.
+    body_decode_failed = False
     try:
         with closing(HTTPSConnection(_API_HOST, timeout=timeout)) as connection:
             connection.request(method, f"{_API_PATH}{path}", body=body, headers=headers)
@@ -95,6 +96,9 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
                 retry_after = _retry_after(response.getheader("Retry-After"))
                 try:
                     payload = json.loads(response.read())
+                except UnicodeDecodeError:
+                    body_decode_failed = True
+                    payload = None
                 except (ValueError, RecursionError):
                     payload = None
     except (OSError, HTTPException):
@@ -104,9 +108,14 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
     if status == 202 and isinstance(payload, dict) and payload.get("error") == "result_expired":
         status = 410
     if not 200 <= status < 300:
-        return _http_error(status, payload if isinstance(payload, dict) else {}, retry_after), None
+        result = _http_error(status, payload if isinstance(payload, dict) else {}, retry_after)
+        if body_decode_failed and idempotency_key is not None:
+            result["idempotency_key"] = idempotency_key
+        return result, None
     if not isinstance(payload, dict):
         return _error("invalid_response", "AI Checker Humanizer returned an invalid response."), None
+    if "error" in payload and idempotency_key is not None:
+        payload["idempotency_key"] = idempotency_key
     return payload, retry_after
 
 
@@ -128,8 +137,10 @@ def _normalize_task_id(task_id):
 
 def _keep_retry_key(result, idempotency_key):
     status = result.get("httpStatus")
+    code = result.get("error")
     if idempotency_key is not None and (
-        result.get("error") in ("network_error", "in_progress")
+        code in ("network_error", "in_progress")
+        or (code == "invalid_response" and status is None)
         or (isinstance(status, int) and 500 <= status < 600)
     ):
         result["idempotency_key"] = idempotency_key
@@ -224,10 +235,12 @@ class Tools:
             return _json(result)
         task_id = _normalize_task_id(result.get("taskId"))
         if task_id is None:
-            return _json(_error("invalid_response", "The rewrite response did not include a valid task ID."))
+            result = _error("invalid_response", "The rewrite response did not include a valid task ID.")
+            _keep_retry_key(result, idempotency_key)
+            return _json(result)
 
         task_info = {"taskId": task_id, "idempotency_key": idempotency_key}
-        # The task lookup does not repeat these submission fields.
+        # Keep submission metadata available if the task lookup omits it.
         for field in ("skippedWords", "replayed"):
             if field in result:
                 task_info[field] = result[field]
@@ -256,6 +269,8 @@ class Tools:
                     )
                 return _json(pending)
 
+        if "skippedWords" in result:
+            task_info.pop("skippedWords", None)
         return _json({**result, **task_info})
 
     def get_humanize_result(self, args, **kwargs):

@@ -30,7 +30,7 @@ hermes plugins install 'https://github.com/supertj/aicheckerhumanizer-mcp#hermes
 | `get_humanize_result` | `task_id` from `humanize_text`. | The task status and any rewritten text. The result is available for about 70 minutes after submission. |
 | `get_balance` | None. | Remaining credits and when each batch expires. |
 
-`humanize_text` waits up to about 50 seconds for the rewrite. It returns `skippedWords` in pending and finished responses if the API provided the count on submission. The count covers words left unchanged because the selected mode doesn't support their language.
+`humanize_text` waits up to about 50 seconds for the rewrite. `skippedWords` counts words left unchanged because the selected mode doesn't support their language. The tool uses the finished task's count if it has one. While the task is pending, or if it finishes without a count, the tool reports the count from submission if the API supplied one.
 
 HTTP errors include `httpStatus`. For an expired rewrite, both `get_humanize_result` and a replay of the original submission return `httpStatus: 410`. The error can include `creditsCharged`, `expiredAt`, and the last task status in both `status` and `taskStatus`. See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields and error codes.
 
@@ -42,7 +42,7 @@ At $10 for 250,000 Starter credits, 1,000 scored words cost $0.04 and 1,000 bill
 
 The plugin uses the same API key and credit balance as REST and the hosted MCP server. To avoid a second charge, reuse the `idempotency_key` with the same text and options within 24 hours. Use 1 to 128 visible ASCII characters (`!` through `~`). When you reuse the key, detection returns the saved result and a rewrite returns the original task ID.
 
-`detect_ai_text` and `humanize_text` generate an idempotency key if you omit it. Submission errors include the key for network failures, 5xx responses, and `in_progress` errors. `humanize_text` also returns it with successful submissions.
+`detect_ai_text` and `humanize_text` generate an idempotency key if you omit it. A submission may have used credits even if the plugin can't confirm the result. The error JSON includes `idempotency_key` after a network error, a response body with invalid text encoding, or an invalid 2xx response. It also includes the key for 5xx responses and `in_progress` errors. `humanize_text` returns the key with successful submissions too.
 
 ## Disclosure
 

@@ -2,6 +2,7 @@ import json
 import sys
 from datetime import UTC, datetime
 from email.utils import format_datetime
+from http.client import IncompleteRead
 from types import ModuleType
 from unittest.mock import MagicMock, Mock
 from uuid import UUID
@@ -88,6 +89,9 @@ def test_detect_without_verdict(handlers, http):
 @pytest.mark.parametrize(("failure", "code", "status"), [
     (TimeoutError, "network_error", None),
     (OSError, "network_error", None),
+    (response(400, b"\xff"), "http_error", 400),
+    (response(200, b"{"), "invalid_response", None),
+    (response(200, {"score": 92}), "invalid_response", None),
     (response(502, b"<html>Bad Gateway</html>"), "http_error", 502),
     (response(503, {"error": "detection_unavailable"}), "detection_unavailable", 503),
     (response(409, {"error": "in_progress", "retryAfter": 3}), "in_progress", 409),
@@ -122,10 +126,24 @@ def test_detect_uncertain_result_can_be_retried_with_same_key(handlers, http, ke
     assert first_post == second_post
 
 
-@pytest.mark.parametrize("skipped_words", [0, 12])
-def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, clock, skipped_words):
+@pytest.mark.parametrize("handler", ["detect_ai_text", "humanize_text"])
+def test_submission_body_read_error_keeps_idempotency_key(handlers, http, handler):
+    reply = response(200, {})
+    reply.read.side_effect = IncompleteRead(b"{")
+    connection = http[1]
+    connection.getresponse.side_effect = [reply]
+
+    result = json.loads(getattr(handlers, handler)({"text": "Check this."}))
+
+    submitted_key = connection.request.call_args.kwargs["headers"]["Idempotency-Key"]
+    assert result["error"] == "network_error"
+    assert result["idempotency_key"] == submitted_key
+
+
+@pytest.mark.parametrize(("skipped_words", "final_count"), [(0, {}), (12, {}), (12, {"skippedWords": 0})])
+def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, clock, skipped_words, final_count):
     connect, connection = http
-    done = {"status": "completed", "output": "Rewritten text."}
+    done = {"status": "completed", "output": "Rewritten text.", **final_count}
     connection.getresponse.side_effect = [
         response(202, {"taskId": _TASK_ID, "status": "queued", "skippedWords": skipped_words}, "4"),
         response(200, {"taskId": _TASK_ID, "status": "running"}),
@@ -135,7 +153,7 @@ def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, 
     result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
 
     assert json.loads(result) == {
-        **done, "taskId": _TASK_ID, "idempotency_key": "rewrite-123", "skippedWords": skipped_words,
+        "skippedWords": skipped_words, **done, "taskId": _TASK_ID, "idempotency_key": "rewrite-123",
     }
     assert clock.sleeps == [4, 2.5]
     assert [call.kwargs["timeout"] for call in connect.call_args_list] == [30, 30, 30]
@@ -256,6 +274,11 @@ def test_humanize_submission_html_gateway_error_can_be_retried_with_same_key(han
     (503, {"error": "capacity"}, "capacity"),
     (503, {"error": "unavailable"}, "unavailable"),
     (409, {"error": "in_progress", "retryAfter": 3}, "in_progress"),
+    (400, b"\xff", "http_error"),
+    (202, b"<html>Unexpected response</html>", "invalid_response"),
+    (202, {"status": "queued"}, "invalid_response"),
+    (202, {"status": "queued", "taskId": "invalid"}, "invalid_response"),
+    (202, {"error": "unexpected_error"}, "unexpected_error"),
 ])
 def test_humanize_submission_errors_keep_idempotency_key(handlers, http, status, body, error):
     http[1].getresponse.side_effect = [response(status, body)]
@@ -272,8 +295,7 @@ def test_humanize_submission_errors_keep_idempotency_key(handlers, http, status,
     (400, b"<html>Bad Request</html>", "http_error"),
     (413, b"<html>Content Too Large</html>", "http_error"),
     (409, {"error": "busy", "retryAfter": 3}, "busy"),
-    (202, b"<html>Unexpected response</html>", "invalid_response"),
-    (202, {"status": "queued"}, "invalid_response"),
+    (400, {"error": "invalid_response"}, "invalid_response"),
 ])
 def test_other_submission_errors_omit_retry_key(handlers, http, handler, status, body, error):
     http[1].getresponse.side_effect = [response(status, body)]

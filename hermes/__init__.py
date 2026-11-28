@@ -39,9 +39,10 @@ def register(ctx):
                 "when available, or a reason if there is no verdict. English and Portuguese "
                 "can include sentence scores. Spanish and French get whole-text results. "
                 "Costs one credit per scored word only when there is a verdict. The tool "
-                "generates an idempotency key if you omit it. It returns the key on network "
-                "errors, 5xx responses, and in_progress errors. If you retry, use the returned "
-                "idempotency_key and the same text within 24 hours to avoid a second charge."
+                "generates an idempotency key if you omit it. If the result is uncertain, "
+                "such as after a network error or an invalid 2xx response, the error can "
+                "include idempotency_key. If you retry, reuse that key and the same text "
+                "within 24 hours to avoid a second charge."
                 + _HTTP_ERROR
             ),
             "parameters": {
@@ -65,9 +66,11 @@ def register(ctx):
                 "requests over 200 chunks. Waits up to about 50 seconds for the rewritten text. "
                 "Use taskId with get_humanize_result if the task is still in progress or its "
                 "status is unavailable. When present, skippedWords counts words left unchanged "
-                "because the selected mode doesn't support their language. The tool generates an idempotency "
-                "key if you omit it. It returns the key with successful submissions and when "
-                "submission fails with a network error, a 5xx response, or an in_progress error. "
+                "because the selected mode doesn't support their language. The tool uses the "
+                "finished task's count if it has one, or the count from submission. It generates an "
+                "idempotency key if you omit it and returns it with successful submissions. "
+                "If the submission outcome is uncertain, such as after a network error or "
+                "an invalid 2xx response, the error can also include idempotency_key. "
                 "If you retry, reuse the returned idempotency_key with the same text and "
                 "options within 24 hours to avoid a second charge. Replaying a submission for an expired "
                 "rewrite returns httpStatus 410. "
