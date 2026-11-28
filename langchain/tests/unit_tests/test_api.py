@@ -6,7 +6,7 @@ from uuid import UUID
 import httpx
 import pytest
 import respx
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from langchain_aicheckerhumanizer import (
     AICheckerHumanizerAPIWrapper,
@@ -108,6 +108,26 @@ def test_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
         ValueError, match="Set AICHECKERHUMANIZER_API_KEY or pass api_key"
     ):
         AICheckerHumanizerAPIWrapper()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://example.test/api/v1",
+        "http://localhost/api/v1",
+        "https://",
+        "https://example.test:bad/api/v1",
+        "/api/v1",
+    ],
+)
+def test_base_url_requires_https(
+    api: AICheckerHumanizerAPIWrapper, base_url: str
+) -> None:
+    with pytest.raises(ValidationError, match="base_url must be an absolute HTTPS URL"):
+        AICheckerHumanizerAPIWrapper(api_key=api.api_key, base_url=base_url)
+    with pytest.raises(ValidationError, match="base_url must be an absolute HTTPS URL"):
+        api.base_url = base_url
+    assert api.base_url == BASE
 
 
 @pytest.mark.parametrize(

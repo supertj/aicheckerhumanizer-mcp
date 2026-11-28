@@ -1,8 +1,10 @@
 # AI Checker Humanizer for LangChain
 
-Use the [AI detection API](https://aicheckerhumanizer.com/ai-detector-api) to score a draft and the [AI humanizer API](https://aicheckerhumanizer.com/ai-humanizer-api) to rewrite it. The toolkit works with LangChain v1.
+Use the [AI detection API](https://aicheckerhumanizer.com/ai-detector-api) to score a draft and the [AI humanizer API](https://aicheckerhumanizer.com/ai-humanizer-api) to rewrite it.
 
 ## Install
+
+The package requires `langchain-core` 1.x.
 
 ```bash
 pip install langchain-aicheckerhumanizer
@@ -33,7 +35,7 @@ Each tool returns a JSON string on success and supports `ainvoke`. Detection acc
 
 By default, the rewrite tool waits up to 120 seconds after submission, including the status checks and the pauses between them. Set `humanize.max_wait_seconds` to change the limit.
 
-If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If a status check fails with a temporary error, the response also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission.
+If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If polling stops after a temporary error such as a malformed response, the result also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission.
 
 When the API reports an expired result, `get_result` returns `result_expired` with `httpStatus` 410. Resubmitting with the same `idempotency_key` within 24 hours reports the same error. The response also includes `taskStatus`, `creditsCharged` and `expiredAt` when available.
 
@@ -63,6 +65,10 @@ See `examples/agent.py` for a complete invocation.
 
 Detection costs 1 credit per scored word when there is a verdict. Rewriting costs 5 credits per original word in each chunk it successfully rewrites. A chunk is a paragraph or part of a long paragraph. Chunks under 10 words count as 10 for billing.
 
-Reuse the same `idempotency_key`, text and options within 24 hours to avoid another charge for a completed check or accepted rewrite. The detect and rewrite tools generate a key when you omit it. If the error JSON includes `idempotencyKey`, pass it as `idempotency_key` when retrying the same request. The field lets you recover a submission that may have reached the server. It appears on transport failures (including timeouts), response decoding failures, invalid 2xx responses, HTTP 5xx errors and `in_progress` errors.
+Reuse the same `idempotency_key`, text and options within 24 hours to avoid another charge for a completed check or accepted rewrite. The detect and rewrite tools generate a key when you omit it.
+
+The server may have accepted a submission even if it times out or the connection drops. When the error JSON includes `idempotencyKey`, retry the same request with that value as `idempotency_key`. The tools also return the key after decoding errors, malformed 2xx responses, HTTP 5xx and `in_progress`.
+
+When a rewrite has status `failed` or `cancelled`, the old key still points to that task. To start a fresh rewrite, leave `idempotency_key` out or pass a new one. This also applies to results with reason `not_humanized`, which use no credits.
 
 See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields, errors and service limits.

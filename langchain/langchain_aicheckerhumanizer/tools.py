@@ -19,6 +19,7 @@ from .api import (
     _IDEMPOTENCY_KEY_MAX_LENGTH,
     _IDEMPOTENCY_KEY_PATTERN,
     _REQUEST_TIMEOUT_MESSAGE,
+    _TERMINAL_STATUSES,
     AICheckerHumanizerAPIWrapper,
     AICheckerHumanizerError,
     HumanizeMode,
@@ -31,7 +32,6 @@ else:
     # Older LangChain versions only support string output from an error handler.
     _ToolErrorOutput = getattr(tool_base, "ToolExceptionHandlerOutput", str)
 
-_PENDING_STATUSES = ("queued", "running", "pending")
 _DEFAULT_POLL_SECONDS = 3
 _GET_RESULT_NAME = "ai_checker_humanizer_get_result"
 
@@ -64,7 +64,8 @@ class _HumanizeInput(BaseModel):
         pattern=_IDEMPOTENCY_KEY_PATTERN,
         description=(
             "Reuse with the same text and options within 24 hours "
-            "to get the same task without another charge."
+            "to get the same task without another charge. If the task failed, was "
+            "cancelled or ended with reason not_humanized, use a new key or omit it."
         ),
     )
 
@@ -125,7 +126,7 @@ def _humanize_result(
     skipped_words: int | None = None,
     error: AICheckerHumanizerError | None = None,
 ) -> str:
-    if task.get("status") in _PENDING_STATUSES:
+    if task.get("status") not in _TERMINAL_STATUSES:
         message = (
             f"Check again later with {_GET_RESULT_NAME}. "
             "Set task_id to the returned taskId. "
@@ -151,7 +152,12 @@ def _poll_error_result(
     task: dict[str, Any], error: AICheckerHumanizerError, *, skipped_words: int | None
 ) -> str:
     status = error.status
-    if status is None or status == 429 or 500 <= status < 600:
+    if (
+        status is None
+        or status == 429
+        or 500 <= status < 600
+        or (200 <= status < 300 and error.code == "invalid_response")
+    ):
         return _humanize_result(task, skipped_words=skipped_words, error=error)
     raise _tool_error(error, task_id=task["taskId"]) from error
 
@@ -189,9 +195,10 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
         "successfully. Chunks under 10 words are billed as 10. "
         "Reusing an idempotency_key with the same text and options within 24 hours "
         "returns the same task without another charge. If the error JSON includes "
-        "idempotencyKey, retry with it as idempotency_key. Returns JSON "
-        "with the rewritten text and any available scores, or a task ID and status "
-        "if the rewrite is still pending."
+        "idempotencyKey, retry with it as idempotency_key. If the task failed, was "
+        "cancelled or ended with reason not_humanized (no credits used), retry "
+        "with a new idempotency_key or omit it. "
+        "Returns task JSON with the task ID, status and rewritten text when available."
     )
     args_schema: type[BaseModel] = _HumanizeInput
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(
@@ -216,9 +223,11 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
         except AICheckerHumanizerError as exc:
             raise _tool_error(exc) from exc
 
-        if task.get("status") not in _PENDING_STATUSES or not self.max_wait_seconds:
+        if task.get("status") in _TERMINAL_STATUSES or not self.max_wait_seconds:
             return _humanize_result(task)
 
+        # Asynchronous polling enforces a total deadline. Sync HTTPX timeouts
+        # only limit individual operations, such as reading each response chunk.
         deadline = monotonic() + self.max_wait_seconds
         try:
             asyncio.get_running_loop()
@@ -252,7 +261,7 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
         except AICheckerHumanizerError as exc:
             raise _tool_error(exc) from exc
 
-        if task.get("status") not in _PENDING_STATUSES or not self.max_wait_seconds:
+        if task.get("status") in _TERMINAL_STATUSES or not self.max_wait_seconds:
             return _humanize_result(task)
 
         return await self._poll(task, deadline=monotonic() + self.max_wait_seconds)
@@ -260,7 +269,7 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
     async def _poll(self, task: dict[str, Any], *, deadline: float) -> str:
         skipped_words = task.get("skippedWords")
         async with httpx.AsyncClient() as client:
-            while task.get("status") in _PENDING_STATUSES:
+            while task.get("status") not in _TERMINAL_STATUSES:
                 delay = _poll_delay(task)
                 if delay >= deadline - monotonic():
                     break
@@ -296,7 +305,9 @@ class AICheckerHumanizerGetResultTool(BaseTool):
         "Fetch a rewrite task using its taskId as task_id. Returns task JSON with "
         "the current status and rewritten text when available. Checking status or "
         "fetching the result costs no credits. Results are available for about "
-        "70 minutes after submission."
+        "70 minutes after submission. A task with reason not_humanized uses no "
+        "credits. If the task failed, was cancelled or ended with reason "
+        "not_humanized, retry the rewrite with a new idempotency_key or omit it."
     )
     args_schema: type[BaseModel] = _GetResultInput
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(

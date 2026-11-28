@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import httpx
 from langchain_core.utils import secret_from_env
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from ._version import __version__
 
@@ -20,6 +20,12 @@ _API_KEY_ENV = "AICHECKERHUMANIZER_API_KEY"
 _REQUEST_TIMEOUT_MESSAGE = "The request to AI Checker Humanizer timed out."
 _IDEMPOTENCY_KEY_PATTERN = r"^[\x21-\x7e]+$"
 _IDEMPOTENCY_KEY_MAX_LENGTH = 128
+_TERMINAL_STATUSES = frozenset(
+    {"completed", "partial", "unchanged", "failed", "cancelled"}
+)
+_NEW_KEY_GUIDANCE = (
+    "To retry, send the text with a new idempotency key, or without one."
+)
 
 
 class HumanizeMode(str, Enum):
@@ -126,6 +132,23 @@ def _valid_response(data: dict[str, Any], path: str) -> bool:
     return True
 
 
+def _add_terminal_retry_guidance(task: dict[str, Any]) -> None:
+    status = task.get("status")
+    if not isinstance(status, str) or status not in _TERMINAL_STATUSES:
+        return
+    not_humanized = task.get("reason") == "not_humanized"
+    if not not_humanized and status not in ("failed", "cancelled"):
+        return
+
+    task.pop("idempotencyKey", None)
+    task.pop("idempotency_key", None)
+    message = task.get("message")
+    if not isinstance(message, str) or not message:
+        message = "No credits were charged." if not_humanized else ""
+    if not message.endswith(_NEW_KEY_GUIDANCE):
+        task["message"] = f"{message} {_NEW_KEY_GUIDANCE}".strip()
+
+
 def _parse_response(
     response: httpx.Response, *, path: str, submission_key: str | None
 ) -> dict[str, Any]:
@@ -145,6 +168,8 @@ def _parse_response(
 
     if not 200 <= status < 300:
         error = data if isinstance(data, dict) else {}
+        if path.startswith("/humanize") and status == 410:
+            _add_terminal_retry_guidance(error)
         code = error.get("error")
         message = error.get("message")
         if not isinstance(message, str) or not message:
@@ -181,6 +206,7 @@ def _parse_response(
         # A replay can return its task ID even if the task view is unavailable.
         if not isinstance(data.get("status"), str):
             data["status"] = "pending"
+        _add_terminal_retry_guidance(data)
         retry_after = _seconds_header(response)
         if retry_after is not None and _integer(data, "retryAfter") is None:
             data["retryAfter"] = retry_after
@@ -213,6 +239,8 @@ def _request_error(
 class AICheckerHumanizerAPIWrapper(BaseModel):
     """Call the API with an explicit key or AICHECKERHUMANIZER_API_KEY."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
     api_key: SecretStr = Field(
         default_factory=secret_from_env(
             _API_KEY_ENV,
@@ -225,6 +253,17 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
     base_url: str = "https://aicheckerhumanizer.com/api/v1"
     # Allow time for the synchronous detection route to reach its 60-second limit.
     timeout: float = Field(default=65, gt=0, allow_inf_nan=False)
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        try:
+            url = httpx.URL(value)
+        except httpx.InvalidURL as exc:
+            raise ValueError("base_url must be an absolute HTTPS URL.") from exc
+        if url.scheme != "https" or not url.host:
+            raise ValueError("base_url must be an absolute HTTPS URL.")
+        return value
 
     def detect(
         self, text: str, *, idempotency_key: str | None = None
