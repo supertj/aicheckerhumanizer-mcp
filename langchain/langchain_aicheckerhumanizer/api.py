@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from contextlib import nullcontext
 from enum import Enum
 from functools import partial
 from typing import Any
@@ -16,6 +18,8 @@ from ._version import __version__
 
 _API_KEY_ENV = "AICHECKERHUMANIZER_API_KEY"
 _REQUEST_TIMEOUT_MESSAGE = "The request to AI Checker Humanizer timed out."
+_IDEMPOTENCY_KEY_PATTERN = r"^[\x21-\x7e]+$"
+_IDEMPOTENCY_KEY_MAX_LENGTH = 128
 
 
 class HumanizeMode(str, Enum):
@@ -48,6 +52,8 @@ class AICheckerHumanizerError(Exception):
         credits_remaining: int | None = None,
         credits_needed: int | None = None,
         max_words: int | None = None,
+        idempotency_key: str | None = None,
+        body: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -57,6 +63,8 @@ class AICheckerHumanizerError(Exception):
         self.credits_remaining = credits_remaining
         self.credits_needed = credits_needed
         self.max_words = max_words
+        self.idempotency_key = idempotency_key
+        self.body = body if body is not None else {}
 
     def __reduce__(
         self,
@@ -80,23 +88,46 @@ def _integer(data: dict[str, Any], key: str) -> int | None:
     return value if type(value) is int else None
 
 
+def _submission_key(key: str | None) -> str:
+    if key is None:
+        return str(uuid4())
+    if len(key) > _IDEMPOTENCY_KEY_MAX_LENGTH or not re.fullmatch(
+        _IDEMPOTENCY_KEY_PATTERN, key
+    ):
+        raise ValueError("idempotency_key must be 1–128 visible ASCII characters.")
+    return key
+
+
 def _submission_message(message: str, submission_key: str | None) -> str:
     if submission_key is None:
         return message
     return (
-        f"{message} Retry with the same text and options. "
+        f"{message} Retry with the same input. "
         f"Set idempotency_key to {submission_key!r}."
     )
 
 
+def _valid_response(data: dict[str, Any], path: str) -> bool:
+    if path == "/detect":
+        return "score" in data and (
+            data["score"] is None or _integer(data, "score") is not None
+        )
+    if path.startswith("/humanize"):
+        task_id = data.get("taskId")
+        return (
+            isinstance(task_id, str)
+            and bool(task_id)
+            and (path == "/humanize" or isinstance(data.get("status"), str))
+        )
+    return True
+
+
 def _parse_response(
-    response: httpx.Response, *, is_task: bool, submission_key: str | None
+    response: httpx.Response, *, path: str, submission_key: str | None
 ) -> dict[str, Any]:
-    has_json = True
     try:
         data = response.json()
     except ValueError:
-        has_json = False
         data = None
 
     if not response.is_success:
@@ -105,37 +136,42 @@ def _parse_response(
         message = error.get("message")
         if not isinstance(message, str) or not message:
             message = f"AI Checker Humanizer returned HTTP {response.status_code}."
-        if response.status_code >= 500 or not has_json:
-            message = _submission_message(message, submission_key)
+        retry_key = (
+            submission_key
+            if response.status_code >= 500
+            or not isinstance(code, str)
+            or code == "in_progress"
+            else None
+        )
         retry_after = _integer(error, "retryAfter")
         raise AICheckerHumanizerError(
             status=response.status_code,
             code=code if isinstance(code, str) else "http_error",
-            message=message,
+            message=_submission_message(message, retry_key),
             retry_after=(
                 retry_after if retry_after is not None else _seconds_header(response)
             ),
             credits_remaining=_integer(error, "creditsRemaining"),
             credits_needed=_integer(error, "creditsNeeded"),
             max_words=_integer(error, "maxWords"),
+            idempotency_key=retry_key,
+            body=error,
         )
 
-    if not isinstance(data, dict) or (
-        is_task
-        and (
-            not isinstance(data.get("status"), str)
-            or not isinstance(data.get("taskId"), str)
-        )
-    ):
+    if not isinstance(data, dict) or not _valid_response(data, path):
         raise AICheckerHumanizerError(
             status=response.status_code,
             code="invalid_response",
             message=_submission_message(
                 "AI Checker Humanizer returned an invalid response.", submission_key
             ),
+            idempotency_key=submission_key,
         )
 
-    if is_task:
+    if path.startswith("/humanize"):
+        # A replay can return its task ID even if the task view is unavailable.
+        if not isinstance(data.get("status"), str):
+            data["status"] = "pending"
         retry_after = _seconds_header(response)
         if retry_after is not None and _integer(data, "retryAfter") is None:
             data["retryAfter"] = retry_after
@@ -152,7 +188,10 @@ def _request_error(
         code = "request_error"
         message = "The request to AI Checker Humanizer could not be sent or completed."
     return AICheckerHumanizerError(
-        status=None, code=code, message=_submission_message(message, submission_key)
+        status=None,
+        code=code,
+        message=_submission_message(message, submission_key),
+        idempotency_key=submission_key,
     )
 
 
@@ -169,14 +208,18 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
         )
     )
     base_url: str = "https://aicheckerhumanizer.com/api/v1"
-    timeout: float = Field(default=30, gt=0, allow_inf_nan=False)
+    # Allow time for the synchronous detection route to reach its 60-second limit.
+    timeout: float = Field(default=65, gt=0, allow_inf_nan=False)
 
     def detect(
         self, text: str, *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
         """Check text for AI writing and return the detection response."""
         return self._request(
-            "POST", "/detect", data={"text": text}, idempotency_key=idempotency_key
+            "POST",
+            "/detect",
+            data={"text": text},
+            idempotency_key=_submission_key(idempotency_key),
         )
 
     async def adetect(
@@ -184,7 +227,10 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
     ) -> dict[str, Any]:
         """Check text for AI writing asynchronously."""
         return await self._arequest(
-            "POST", "/detect", data={"text": text}, idempotency_key=idempotency_key
+            "POST",
+            "/detect",
+            data={"text": text},
+            idempotency_key=_submission_key(idempotency_key),
         )
 
     def humanize_start(
@@ -200,9 +246,7 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
             "POST",
             "/humanize",
             data={"text": text, "mode": mode, "strength": strength},
-            idempotency_key=(
-                str(uuid4()) if idempotency_key is None else idempotency_key
-            ),
+            idempotency_key=_submission_key(idempotency_key),
         )
 
     async def ahumanize_start(
@@ -218,25 +262,37 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
             "POST",
             "/humanize",
             data={"text": text, "mode": mode, "strength": strength},
-            idempotency_key=(
-                str(uuid4()) if idempotency_key is None else idempotency_key
-            ),
+            idempotency_key=_submission_key(idempotency_key),
         )
 
     def humanize_get(
-        self, task_id: str, *, timeout: float | None = None
+        self,
+        task_id: str,
+        *,
+        timeout: float | None = None,
+        client: httpx.Client | None = None,
     ) -> dict[str, Any]:
         """Fetch a rewrite task and any available output."""
         return self._request(
-            "GET", f"/humanize/{quote(task_id, safe='')}", timeout=timeout
+            "GET",
+            f"/humanize/{quote(task_id, safe='')}",
+            timeout=timeout,
+            client=client,
         )
 
     async def ahumanize_get(
-        self, task_id: str, *, timeout: float | None = None
+        self,
+        task_id: str,
+        *,
+        timeout: float | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
         """Fetch a rewrite task asynchronously."""
         return await self._arequest(
-            "GET", f"/humanize/{quote(task_id, safe='')}", timeout=timeout
+            "GET",
+            f"/humanize/{quote(task_id, safe='')}",
+            timeout=timeout,
+            client=client,
         )
 
     def balance(self) -> dict[str, Any]:
@@ -264,25 +320,21 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
         data: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         timeout: float | None = None,
+        client: httpx.Client | None = None,
     ) -> dict[str, Any]:
-        submission_key = idempotency_key if path == "/humanize" else None
         try:
-            with httpx.Client(
-                timeout=self.timeout if timeout is None else timeout
-            ) as client:
-                response = client.request(
+            context = httpx.Client() if client is None else nullcontext(client)
+            with context as session:
+                response = session.request(
                     method,
                     self.base_url.rstrip("/") + path,
                     headers=self._headers(idempotency_key),
                     json=data,
+                    timeout=self.timeout if timeout is None else timeout,
                 )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
-            raise _request_error(exc, submission_key=submission_key) from exc
-        return _parse_response(
-            response,
-            is_task=path.startswith("/humanize"),
-            submission_key=submission_key,
-        )
+            raise _request_error(exc, submission_key=idempotency_key) from exc
+        return _parse_response(response, path=path, submission_key=idempotency_key)
 
     async def _arequest(
         self,
@@ -292,22 +344,18 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
         data: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         timeout: float | None = None,
+        client: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
-        submission_key = idempotency_key if path == "/humanize" else None
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout if timeout is None else timeout
-            ) as client:
-                response = await client.request(
+            context = httpx.AsyncClient() if client is None else nullcontext(client)
+            async with context as session:
+                response = await session.request(
                     method,
                     self.base_url.rstrip("/") + path,
                     headers=self._headers(idempotency_key),
                     json=data,
+                    timeout=self.timeout if timeout is None else timeout,
                 )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
-            raise _request_error(exc, submission_key=submission_key) from exc
-        return _parse_response(
-            response,
-            is_task=path.startswith("/humanize"),
-            submission_key=submission_key,
-        )
+            raise _request_error(exc, submission_key=idempotency_key) from exc
+        return _parse_response(response, path=path, submission_key=idempotency_key)

@@ -31,7 +31,7 @@ Each tool returns a JSON string on success and supports `ainvoke`. Detection acc
 - Mode can be `standard` (default), `academic`, `casual` or `concise`.
 - Strength can be `light`, `medium` (default) or `heavy`.
 
-The rewrite tool polls for up to 120 seconds after submission. If the task is still pending or a poll fails, the response includes its `taskId` and last known status. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission.
+The rewrite tool polls for the result within a 120-second window after submission. If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If a status check fails with a temporary error, the response also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission. After it expires, `get_result` can return a `result_expired` error with the task status, credits charged and expiry time.
 
 ## Use the toolkit in an agent
 
@@ -55,6 +55,6 @@ See `examples/agent.py` for a complete invocation.
 
 Detection costs 1 credit per scored word when there is a verdict. Rewriting costs 5 credits per original word in each chunk it successfully rewrites. A chunk is a paragraph or part of a long paragraph. Chunks under 10 words count as 10 for billing.
 
-Reuse the same `idempotency_key`, text and options within 24 hours to avoid another charge for a completed check or accepted rewrite. Rewrite submissions generate a key when you omit it. If the submission fails with a network error, retry with the key from the error message and the same text and options.
+Reuse the same `idempotency_key`, text and options within 24 hours to avoid another charge for a completed check or accepted rewrite. The detect and rewrite tools generate a key when you omit it. If an error includes the key, use it to retry the same request.
 
 See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields, errors and service limits.

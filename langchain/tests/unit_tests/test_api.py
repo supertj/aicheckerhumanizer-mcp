@@ -1,6 +1,7 @@
 import json
 import pickle
 from typing import Any
+from uuid import UUID
 
 import httpx
 import pytest
@@ -92,9 +93,13 @@ def test_explicit_key_and_custom_settings(
     )
     assert custom.api_key != api.api_key
     assert custom.api_key.get_secret_value() not in repr(custom)
-    route = respx_mock.post("https://example.test/api/v1/detect").respond(json={})
-    assert custom.detect("Draft") == {}
-    assert_request(route, custom, body={"text": "Draft"})
+    route = respx_mock.post("https://example.test/api/v1/detect").respond(
+        json={"score": None}
+    )
+    assert custom.detect("Draft") == {"score": None}
+    key = route.calls.last.request.headers["Idempotency-Key"]
+    assert UUID(key).version == 4
+    assert_request(route, custom, body={"text": "Draft"}, key=key)
 
 
 def test_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -154,7 +159,13 @@ def test_api_error_mapping(
     error = caught.value
     assert error.status == status
     assert error.code == code
-    assert error.message == "Request failed."
+    assert error.body == {"error": code, "message": "Request failed.", **extra}
+    if status >= 500 or code == "in_progress":
+        assert error.idempotency_key is not None
+        assert f"Set idempotency_key to {error.idempotency_key!r}" in error.message
+    else:
+        assert error.idempotency_key is None
+        assert error.message == "Request failed."
     assert error.retry_after == retry_after
     assert error.credits_remaining == extra.get("creditsRemaining")
     assert error.credits_needed == extra.get("creditsNeeded")
@@ -213,3 +224,27 @@ async def test_transport_errors(
         await api.adetect("Draft")
     assert caught.value.code == code
     assert caught.value.status is None
+
+
+@pytest.mark.parametrize("key", ["", "check 1", "key\n", "\tkey", "é", "x" * 129])
+async def test_wrapper_rejects_invalid_idempotency_keys(
+    api: AICheckerHumanizerAPIWrapper,
+    respx_mock: respx.MockRouter,
+    key: str,
+) -> None:
+    for submit in (api.detect, api.humanize_start):
+        with pytest.raises(ValueError, match="idempotency_key"):
+            submit("Draft", idempotency_key=key)
+    for asubmit in (api.adetect, api.ahumanize_start):
+        with pytest.raises(ValueError, match="idempotency_key"):
+            await asubmit("Draft", idempotency_key=key)
+    assert not respx_mock.calls
+
+
+@pytest.mark.parametrize("key", ["!", "!" + "x" * 126 + "~"])
+def test_wrapper_accepts_idempotency_key_boundaries(
+    api: AICheckerHumanizerAPIWrapper, respx_mock: respx.MockRouter, key: str
+) -> None:
+    route = respx_mock.post(f"{BASE}/detect").respond(json={"score": 42})
+    api.detect("Draft", idempotency_key=key)
+    assert_request(route, api, body={"text": "Draft"}, key=key)

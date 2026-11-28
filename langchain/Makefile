@@ -4,7 +4,7 @@ test:
 	uv run --locked pytest tests/unit_tests
 
 integration_tests:
-	uv run pytest tests/integration_tests
+	uv run --locked pytest tests/integration_tests
 
 lint:
 	uv run --locked ruff check .
