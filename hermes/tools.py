@@ -23,7 +23,7 @@ _DETECT_TIMEOUT = 65  # The synchronous endpoint can run for 60 seconds.
 _OTHER_TIMEOUT = 30
 _HUMANIZE_WAIT = 50
 _POLL_INTERVAL = 2.5
-_PENDING = ("queued", "running")
+_TERMINAL_STATUSES = frozenset({"completed", "partial", "unchanged", "failed", "cancelled"})
 
 
 class SecretScopeUnavailableError(Exception):
@@ -112,7 +112,7 @@ def _request(key, method, path, *, timeout, body=None, idempotency_key=None):
         if body_decode_failed and idempotency_key is not None:
             result["idempotency_key"] = idempotency_key
         return result, None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or (method == "GET" and "error" in payload):
         return _error("invalid_response", "AI Checker Humanizer returned an invalid response."), None
     if "error" in payload and idempotency_key is not None:
         payload["idempotency_key"] = idempotency_key
@@ -144,6 +144,20 @@ def _keep_retry_key(result, idempotency_key):
         or (isinstance(status, int) and 500 <= status < 600)
     ):
         result["idempotency_key"] = idempotency_key
+
+
+def _rewrite_result(result):
+    status = result.get("status")
+    not_humanized = result.get("reason") == "not_humanized"
+    if isinstance(status, str) and status in _TERMINAL_STATUSES and (
+        not_humanized or status in ("failed", "cancelled")
+    ):
+        result.pop("idempotency_key", None)
+        message = result.get("message")
+        if not (not_humanized and isinstance(message, str) and message):
+            advice = "To retry, call humanize_text with a new idempotency_key or omit it."
+            result["message"] = f"{message} {advice}" if isinstance(message, str) and message else advice
+    return _json(result)
 
 
 class Tools:
@@ -232,7 +246,7 @@ class Tools:
                     "Could not confirm the rewrite submission. To avoid a second charge, retry "
                     "humanize_text within 24 hours with the returned idempotency_key and the same text and options."
                 )
-            return _json(result)
+            return _rewrite_result(result)
         task_id = _normalize_task_id(result.get("taskId"))
         if task_id is None:
             result = _error("invalid_response", "The rewrite response did not include a valid task ID.")
@@ -248,7 +262,7 @@ class Tools:
             status = result.get("status")
             pending = dict(task_info)
             if isinstance(status, str):
-                if status not in _PENDING:
+                if status in _TERMINAL_STATUSES:
                     break
                 pending["status"] = status
             # A replay without a status can be checked immediately unless Retry-After says to wait.
@@ -261,7 +275,7 @@ class Tools:
             if remaining <= 0:
                 return _json(pending)
             result, retry_after = _get_task(key, task_id, timeout=min(_OTHER_TIMEOUT, remaining))
-            if result.get("error") == "network_error":
+            if result.get("error") in ("network_error", "invalid_response") and "httpStatus" not in result:
                 if monotonic() < deadline:
                     pending["error"] = result["error"]
                     pending["message"] = (
@@ -271,7 +285,7 @@ class Tools:
 
         if "skippedWords" in result:
             task_info.pop("skippedWords", None)
-        return _json({**result, **task_info})
+        return _rewrite_result({**result, **task_info})
 
     def get_humanize_result(self, args, **kwargs):
         key, result = self._api_key()
@@ -283,7 +297,7 @@ class Tools:
         if result is None:
             result, _ = _get_task(key, task_id, timeout=_OTHER_TIMEOUT)
         result["taskId"] = task_id
-        return _json(result)
+        return _rewrite_result(result)
 
     def get_balance(self, args, **kwargs):
         key, error = self._api_key()

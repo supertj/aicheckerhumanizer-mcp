@@ -4,16 +4,16 @@ Check a draft for AI writing with the [AI detection API](https://aicheckerhumani
 
 ## Install
 
-Once the plugin is listed in the Hermes catalog, install it by name.
-
-```sh
-hermes plugins install aicheckerhumanizer
-```
-
-To install from Git before the catalog listing is available, use the repository URL with the plugin directory after `#`.
+To install from Git, use the repository URL with the plugin directory after `#`.
 
 ```sh
 hermes plugins install 'https://github.com/supertj/aicheckerhumanizer-mcp#hermes'
+```
+
+Once the plugin is listed in the Hermes catalog, you can also install it by name.
+
+```sh
+hermes plugins install aicheckerhumanizer
 ```
 
 1. Create an API key on your [account page](https://aicheckerhumanizer.com/account#api).
@@ -30,7 +30,9 @@ hermes plugins install 'https://github.com/supertj/aicheckerhumanizer-mcp#hermes
 | `get_humanize_result` | `task_id` from `humanize_text`. | The task status and any rewritten text. The result is available for about 70 minutes after submission. |
 | `get_balance` | None. | Remaining credits and when each batch expires. |
 
-`humanize_text` waits up to about 50 seconds for the rewrite. `skippedWords` counts words left unchanged because the selected mode doesn't support their language. The tool uses the finished task's count if it has one. While the task is pending, or if it finishes without a count, the tool reports the count from submission if the API supplied one.
+`humanize_text` waits up to about 50 seconds for the rewrite. `skippedWords` counts words left unchanged because the selected mode doesn't support their language. If both the submission and the finished task report a count, use the finished task's count.
+
+If every paragraph to rewrite is in English and the input has at least 150 English words that make up at least 80% of all words, the API returns a rewrite only if its detector rates the full text likely human. In that case the selected `mode` controls the rewrite and `strength` has no effect.
 
 HTTP errors include `httpStatus`. For an expired rewrite, both `get_humanize_result` and a replay of the original submission return `httpStatus: 410`. The error can include `creditsCharged`, `expiredAt`, and the last task status in both `status` and `taskStatus`. See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields and error codes.
 
@@ -42,7 +44,9 @@ At $10 for 250,000 Starter credits, 1,000 scored words cost $0.04 and 1,000 bill
 
 The plugin uses the same API key and credit balance as REST and the hosted MCP server. To avoid a second charge, reuse the `idempotency_key` with the same text and options within 24 hours. Use 1 to 128 visible ASCII characters (`!` through `~`). When you reuse the key, detection returns the saved result and a rewrite returns the original task ID.
 
-`detect_ai_text` and `humanize_text` generate an idempotency key if you omit it. A submission may have used credits even if the plugin can't confirm the result. The error JSON includes `idempotency_key` after a network error, a response body with invalid text encoding, or an invalid 2xx response. It also includes the key for 5xx responses and `in_progress` errors. `humanize_text` returns the key with successful submissions too.
+`detect_ai_text` and `humanize_text` generate an idempotency key if you omit it. If a submission error includes `idempotency_key`, retry with that key. A timed-out request may have already used credits.
+
+If a rewrite ends with reason `not_humanized`, no credits were charged. To retry after `not_humanized` or a failed or cancelled task, call `humanize_text` with a new `idempotency_key` or omit it. The result omits the old key because reusing it would return the same task.
 
 ## Disclosure
 

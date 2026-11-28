@@ -4,10 +4,12 @@ on:
   pull_request:
     paths:
       - "hermes/**"
+      - ".github/workflows/hermes-ci.yml"
   push:
     branches: [main]
     paths:
       - "hermes/**"
+      - ".github/workflows/hermes-ci.yml"
 
 permissions:
   contents: read

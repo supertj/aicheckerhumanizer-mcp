@@ -16,6 +16,10 @@ _IDEMPOTENCY_KEY = {
     "description": "Reuse the same key, text, and options within 24 hours to avoid a second charge.",
 }
 _HTTP_ERROR = " HTTP errors include httpStatus."
+_REWRITE_RETRY = (
+    "If a rewrite ends with reason not_humanized, no credits were charged. To retry after that "
+    "or after a failed or cancelled task, call humanize_text with a new idempotency_key or omit it."
+)
 
 
 def register(ctx):
@@ -66,16 +70,14 @@ def register(ctx):
                 "requests over 200 chunks. Waits up to about 50 seconds for the rewritten text. "
                 "Use taskId with get_humanize_result if the task is still in progress or its "
                 "status is unavailable. When present, skippedWords counts words left unchanged "
-                "because the selected mode doesn't support their language. The tool uses the "
-                "finished task's count if it has one, or the count from submission. It generates an "
-                "idempotency key if you omit it and returns it with successful submissions. "
-                "If the submission outcome is uncertain, such as after a network error or "
-                "an invalid 2xx response, the error can also include idempotency_key. "
-                "If you retry, reuse the returned idempotency_key with the same text and "
-                "options within 24 hours to avoid a second charge. Replaying a submission for an expired "
+                "because the selected mode doesn't support their language. The tool generates an "
+                "idempotency key if you omit it. If the submission outcome is uncertain, "
+                "reuse the returned idempotency_key with the same text and options within "
+                "24 hours to avoid a second charge. Replaying a submission for an expired "
                 "rewrite returns httpStatus 410. "
                 "Each successfully rewritten chunk costs five credits per original word, "
-                "with a ten-word minimum per chunk."
+                "with a ten-word minimum per chunk. "
+                + _REWRITE_RETRY
                 + _HTTP_ERROR
             ),
             "parameters": {
@@ -88,9 +90,11 @@ def register(ctx):
                         "enum": list(STRENGTHS),
                         "default": "medium",
                         "description": (
-                            "Controls how much each chunk is rewritten. When every paragraph "
-                            "to rewrite is English, the API ignores strength if the input has "
-                            "at least 150 English words and at least 80% of its words are English."
+                            "Controls how much each chunk is rewritten. If every paragraph to rewrite "
+                            "is in English and the input has at least 150 English words that make up "
+                            "at least 80% of all words, the API returns a rewrite only if its detector "
+                            "rates the full text likely human. In that case the selected mode controls "
+                            "the rewrite and strength has no effect."
                         ),
                     },
                     "idempotency_key": _IDEMPOTENCY_KEY,
@@ -110,7 +114,8 @@ def register(ctx):
                 "text. Results are available for about 70 minutes after submission. "
                 "An expired result can include creditsCharged, expiredAt, and the task state in both "
                 "status and taskStatus. "
-                "Looking up a task costs no credits."
+                "Looking up a task costs no credits. "
+                + _REWRITE_RETRY
                 + _HTTP_ERROR
             ),
             "parameters": {

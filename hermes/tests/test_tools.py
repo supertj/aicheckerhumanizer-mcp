@@ -145,8 +145,8 @@ def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, 
     connect, connection = http
     done = {"status": "completed", "output": "Rewritten text.", **final_count}
     connection.getresponse.side_effect = [
-        response(202, {"taskId": _TASK_ID, "status": "queued", "skippedWords": skipped_words}, "4"),
-        response(200, {"taskId": _TASK_ID, "status": "running"}),
+        response(202, {"taskId": _TASK_ID, "status": "created", "skippedWords": skipped_words}, "4"),
+        response(200, {"taskId": _TASK_ID, "status": "future_intermediate_status"}),
         response(200, done),
     ]
 
@@ -169,7 +169,7 @@ def test_humanize_polls_using_server_delay_and_default_interval(handlers, http, 
         assert "Idempotency-Key" not in poll.kwargs["headers"]
 
 
-@pytest.mark.parametrize("status", ["completed", "partial", "unchanged", "failed", "cancelled"])
+@pytest.mark.parametrize("status", ["completed", "partial", "unchanged"])
 def test_humanize_returns_terminal_post_without_polling(handlers, http, clock, status):
     payload = {"taskId": _TASK_ID, "status": status, "output": None}
     http[1].getresponse.side_effect = [response(202, payload)]
@@ -185,6 +185,36 @@ def test_humanize_returns_terminal_post_without_polling(handlers, http, clock, s
     assert json.loads(post.kwargs["body"]) == {
         "text": "Rewrite this.", "mode": "academic", "strength": "heavy",
     }
+
+
+@pytest.mark.parametrize("source", ["submission", "poll", "lookup"])
+@pytest.mark.parametrize(("status", "reason", "server_message"), [
+    ("failed", "not_humanized", "No credits were charged. To retry, send the text with a new key or without one."),
+    ("unchanged", "not_humanized", None),
+    ("failed", "queue_timeout", None),
+    ("cancelled", "cancelled", None),
+])
+def test_failed_rewrite_uses_new_key_on_retry(handlers, http, clock, source, status, reason, server_message):
+    payload = {"taskId": _TASK_ID, "status": status, "reason": reason, "output": None}
+    if server_message:
+        payload["message"] = server_message
+    _, connection = http
+    if source == "lookup":
+        connection.getresponse.side_effect = [response(200, payload)]
+        result = handlers.get_humanize_result({"task_id": _TASK_ID})
+    else:
+        connection.getresponse.side_effect = (
+            [response(202, payload)] if source == "submission" else [
+                response(202, {"taskId": _TASK_ID, "status": "queued"}), response(200, payload),
+            ]
+        )
+        result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {
+        **payload, "message": server_message or "To retry, call humanize_text with a new idempotency_key or omit it.",
+    }
+    assert clock.sleeps == ([2.5] if source == "poll" else [])
+    assert connection.request.call_count == (2 if source == "poll" else 1)
 
 
 def test_humanize_accepts_a_replayed_task_id_without_status(handlers, http, clock):
@@ -371,7 +401,6 @@ def test_expired_task_keeps_status_charge_and_expiration(handlers, http, clock, 
         "message": "The result has expired.",
         "taskId": _TASK_ID,
         "status": status,
-        "reason": "not_humanized",
         "creditsReserved": 75,
         "creditsCharged": 50,
         "expiresAt": "2027-01-23T00:00:00Z",
@@ -409,6 +438,20 @@ def test_expired_replay_is_returned_as_gone_without_polling(handlers, http, cloc
     assert json.loads(result) == {**payload, "taskId": _TASK_ID, "httpStatus": 410, "taskStatus": "running"}
     assert clock.sleeps == []
     assert http[1].request.call_count == 1
+
+
+def test_expired_failed_poll_omits_old_key(handlers, http, clock):
+    payload = {"error": "result_expired", "message": "The result has expired.", "status": "failed"}
+    http[1].getresponse.side_effect = [
+        response(202, {"taskId": _TASK_ID, "status": "queued"}), response(410, payload),
+    ]
+
+    result = handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"})
+
+    assert json.loads(result) == {
+        **payload, "taskStatus": "failed", "httpStatus": 410, "taskId": _TASK_ID,
+        "message": "The result has expired. To retry, call humanize_text with a new idempotency_key or omit it.",
+    }
 
 
 @pytest.mark.parametrize("task_id", [_TASK_ID, f"{{{_TASK_ID}}}", f"urn:uuid:{_TASK_ID}", UUID(_TASK_ID).hex])
@@ -495,7 +538,8 @@ def test_redirect_is_an_http_error(handlers, http):
 
 
 @pytest.mark.parametrize(("status", "error", "retry_after"), [
-    (401, "unauthorized", None), (404, "not_found", None), (429, "rate_limited", "6"),
+    (400, "invalid_response", None), (401, "unauthorized", None), (404, "not_found", None),
+    (429, "rate_limited", "6"),
 ])
 def test_poll_error_is_returned_without_retry(handlers, http, clock, status, error, retry_after):
     payload = {"error": error, "message": "Service detail."}
@@ -514,19 +558,24 @@ def test_poll_error_is_returned_without_retry(handlers, http, clock, status, err
     assert http[1].request.call_count == 2
 
 
-@pytest.mark.parametrize("body", [{}, {"status": 1}, {"status": None}])
-def test_poll_without_string_status_returns_invalid_response(handlers, http, clock, body):
+@pytest.mark.parametrize("body", [{}, {"status": 1}, {"status": None}, {"error": "unexpected"}, b"<html>"])
+def test_invalid_poll_response_returns_pending_task(handlers, http, clock, body):
+    accepted = {"taskId": _TASK_ID, "status": "running", "skippedWords": 12}
     http[1].getresponse.side_effect = [
-        response(202, {"taskId": _TASK_ID, "status": "running"}),
+        response(202, accepted),
         response(200, body),
+        response(200, {"status": "completed", "output": "Rewritten text."}),
     ]
 
     result = json.loads(handlers.humanize_text({"text": "Rewrite this.", "idempotency_key": "rewrite-123"}))
 
-    assert result["error"] == "invalid_response"
-    assert result["taskId"] == _TASK_ID
-    assert result["idempotency_key"] == "rewrite-123"
+    assert result == {
+        **accepted, "idempotency_key": "rewrite-123", "error": "invalid_response",
+        "message": "Could not check the rewrite status. Use taskId with get_humanize_result.",
+    }
     assert http[1].request.call_count == 2
+    lookup = json.loads(handlers.get_humanize_result({"task_id": result["taskId"]}))
+    assert lookup == {"taskId": _TASK_ID, "status": "completed", "output": "Rewritten text."}
 
 
 def test_get_task_without_status_returns_invalid_response(handlers, http):
