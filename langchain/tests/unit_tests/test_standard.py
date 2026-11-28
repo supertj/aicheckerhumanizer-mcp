@@ -10,10 +10,12 @@ from pydantic import SecretStr
 from langchain_aicheckerhumanizer import (
     AICheckerHumanizerAPIWrapper,
     AICheckerHumanizerDetectTool,
+    AICheckerHumanizerGetResultTool,
     AICheckerHumanizerHumanizeTool,
 )
 
 _KEY = "ach_live_" + "x" * 32
+_TASK_ID = "0f92ace1-57c9-4dd1-a675-5c3967295244"
 
 
 class _ToolsStandard(ToolsUnitTests):
@@ -38,16 +40,11 @@ class _ToolsStandard(ToolsUnitTests):
     @pytest.fixture(autouse=True)
     def mock_http(self) -> Iterator[None]:
         base = "https://aicheckerhumanizer.com/api/v1"
+        task = {"taskId": _TASK_ID, "status": "completed", "output": "Edited draft."}
         with respx.mock(assert_all_called=False) as router:
             router.post(f"{base}/detect").respond(json={"score": 30})
-            router.post(f"{base}/humanize").respond(
-                202,
-                json={
-                    "taskId": "0f92ace1-57c9-4dd1-a675-5c3967295244",
-                    "status": "completed",
-                    "output": "Edited draft.",
-                },
-            )
+            router.post(f"{base}/humanize").respond(202, json=task)
+            router.get(f"{base}/humanize/{_TASK_ID}").respond(json=task)
             yield
 
 
@@ -61,3 +58,13 @@ class TestHumanizeStandard(_ToolsStandard):
     @property
     def tool_constructor(self) -> type[BaseTool]:
         return AICheckerHumanizerHumanizeTool
+
+
+class TestGetResultStandard(_ToolsStandard):
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return AICheckerHumanizerGetResultTool
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"task_id": _TASK_ID}

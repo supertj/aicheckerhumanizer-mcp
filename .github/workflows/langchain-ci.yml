@@ -1,13 +1,16 @@
 name: LangChain CI
 
 on:
+  workflow_call:
   pull_request:
     paths:
       - "langchain/**"
+      - ".github/workflows/langchain-*.yml"
   push:
     branches: [main]
     paths:
       - "langchain/**"
+      - ".github/workflows/langchain-*.yml"
 
 permissions:
   contents: read
@@ -31,7 +34,7 @@ jobs:
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           version: "0.12.21"
-          cache-dependency-glob: langchain/pyproject.toml
-      - run: uv sync --python "${{ matrix.python-version }}"
+          cache-dependency-glob: langchain/uv.lock
+      - run: uv sync --locked --group examples --python "${{ matrix.python-version }}"
       - run: make lint
       - run: make test

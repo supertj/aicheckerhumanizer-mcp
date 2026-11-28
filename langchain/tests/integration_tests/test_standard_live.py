@@ -7,7 +7,9 @@ from langchain_core.tools import BaseTool
 from langchain_tests.integration_tests import ToolsIntegrationTests
 
 from langchain_aicheckerhumanizer import (
+    AICheckerHumanizerAPIWrapper,
     AICheckerHumanizerDetectTool,
+    AICheckerHumanizerGetResultTool,
     AICheckerHumanizerHumanizeTool,
 )
 
@@ -57,3 +59,26 @@ class TestHumanizeLive(_ToolsLive):
     @property
     def tool_constructor(self) -> type[BaseTool]:
         return AICheckerHumanizerHumanizeTool
+
+
+@pytest.fixture(scope="session")
+def humanize_task_id() -> str:
+    task = AICheckerHumanizerAPIWrapper().humanize_start(_DRAFT)
+    task_id: str = task["taskId"]
+    return task_id
+
+
+class TestGetResultLive(_ToolsLive):
+    _task_id: str
+
+    @pytest.fixture(autouse=True)
+    def set_task_id(self, humanize_task_id: str) -> None:
+        self._task_id = humanize_task_id
+
+    @property
+    def tool_constructor(self) -> type[BaseTool]:
+        return AICheckerHumanizerGetResultTool
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"task_id": self._task_id}

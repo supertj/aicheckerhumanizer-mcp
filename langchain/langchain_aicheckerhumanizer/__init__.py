@@ -9,6 +9,7 @@ from .api import (
 )
 from .tools import (
     AICheckerHumanizerDetectTool,
+    AICheckerHumanizerGetResultTool,
     AICheckerHumanizerHumanizeTool,
     AICheckerHumanizerToolkit,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "AICheckerHumanizerAPIWrapper",
     "AICheckerHumanizerDetectTool",
     "AICheckerHumanizerError",
+    "AICheckerHumanizerGetResultTool",
     "AICheckerHumanizerHumanizeTool",
     "AICheckerHumanizerToolkit",
     "HumanizeMode",

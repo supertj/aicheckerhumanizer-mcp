@@ -9,7 +9,11 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    uses: ./.github/workflows/langchain-ci.yml
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -32,10 +36,9 @@ jobs:
         run: |
           python - <<'PY'
           import os
-          import tomllib
+          from runpy import run_path
 
-          with open("pyproject.toml", "rb") as file:
-              version = tomllib.load(file)["project"]["version"]
+          version = run_path("langchain_aicheckerhumanizer/_version.py")["__version__"]
           expected = f"langchain-v{version}"
           actual = os.environ["GITHUB_REF_NAME"]
           if actual != expected:

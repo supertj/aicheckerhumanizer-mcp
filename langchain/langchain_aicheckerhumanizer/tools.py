@@ -17,6 +17,7 @@ from .api import (
 
 _PENDING_STATUSES = ("queued", "running")
 _DEFAULT_POLL_SECONDS = 3
+_GET_RESULT_NAME = "ai_checker_humanizer_get_result"
 
 
 class _DetectInput(BaseModel):
@@ -48,6 +49,10 @@ class _HumanizeInput(BaseModel):
             "to get the same task without another charge."
         ),
     )
+
+
+class _GetResultInput(BaseModel):
+    task_id: str = Field(description="The taskId returned by the rewrite tool.")
 
 
 class AICheckerHumanizerDetectTool(BaseTool):
@@ -92,16 +97,25 @@ def _poll_delay(task: dict[str, Any]) -> int:
     return _DEFAULT_POLL_SECONDS
 
 
-def _humanize_result(task: dict[str, Any]) -> str:
+def _humanize_result(
+    task: dict[str, Any], error: AICheckerHumanizerError | None = None
+) -> str:
     if task.get("status") in _PENDING_STATUSES:
+        message = (
+            f"Check again later with {_GET_RESULT_NAME}. "
+            "Set task_id to the returned taskId. "
+            "Results are available for about 70 minutes after submission."
+        )
         task = {
             "taskId": task["taskId"],
             "status": task["status"],
-            "message": (
-                "Check again later in Python with api_wrapper.humanize_get(taskId). "
-                "Results are available for about 70 minutes after submission."
-            ),
+            "message": message,
         }
+        if error is not None:
+            task["error"] = error.code
+            task["message"] = f"{error.message} {message}"
+            if error.retry_after is not None:
+                task["retryAfter"] = error.retry_after
     return json.dumps(task, ensure_ascii=False)
 
 
@@ -112,11 +126,11 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
     description: str = (
         "Rewrite up to 3,000 words. Choose standard, academic, casual or concise "
         "mode and light, medium or heavy strength. Defaults are standard and medium. "
-        "The API charges 5 credits per original word in each rewritten chunk, with "
-        "a 10-word minimum per rewritten chunk. Repeat the same text and options "
+        "The API charges 5 credits per original word in each rewritten chunk "
+        "(minimum 10 words per chunk). Repeat the same text and options "
         "with the same idempotency_key within 24 hours to get the same task without "
         "another charge. Returns JSON with the rewritten text and any available "
-        "scores, or a task ID and status if the rewrite is still running."
+        "scores, or a task ID and status if the rewrite is still pending."
     )
     args_schema: type[BaseModel] = _HumanizeInput
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(
@@ -136,29 +150,24 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
             task = self.api_wrapper.humanize_start(
                 text, mode=mode, strength=strength, idempotency_key=idempotency_key
             )
-            deadline = monotonic() + self.max_wait_seconds
-            while task.get("status") in _PENDING_STATUSES:
-                delay = _poll_delay(task)
-                if delay >= deadline - monotonic():
-                    break
-                sleep(delay)
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    task = self.api_wrapper.humanize_get(
-                        task["taskId"], timeout=min(self.api_wrapper.timeout, remaining)
-                    )
-                except AICheckerHumanizerError as exc:
-                    if (
-                        exc.status is None
-                        and exc.code == "timeout"
-                        and monotonic() >= deadline
-                    ):
-                        break
-                    raise
         except AICheckerHumanizerError as exc:
             raise ToolException(exc.message) from exc
+
+        deadline = monotonic() + self.max_wait_seconds
+        while task.get("status") in _PENDING_STATUSES:
+            delay = _poll_delay(task)
+            if delay >= deadline - monotonic():
+                break
+            sleep(delay)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            try:
+                task = self.api_wrapper.humanize_get(
+                    task["taskId"], timeout=min(self.api_wrapper.timeout, remaining)
+                )
+            except AICheckerHumanizerError as exc:
+                return _humanize_result(task, exc)
         return _humanize_result(task)
 
     async def _arun(
@@ -172,37 +181,72 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
             task = await self.api_wrapper.ahumanize_start(
                 text, mode=mode, strength=strength, idempotency_key=idempotency_key
             )
-            deadline = monotonic() + self.max_wait_seconds
-            while task.get("status") in _PENDING_STATUSES:
-                delay = _poll_delay(task)
-                if delay >= deadline - monotonic():
-                    break
-                await asyncio.sleep(delay)
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    task = await asyncio.wait_for(
-                        self.api_wrapper.ahumanize_get(task["taskId"]),
-                        timeout=remaining,
-                    )
-                except asyncio.TimeoutError:
-                    break
         except AICheckerHumanizerError as exc:
             raise ToolException(exc.message) from exc
+
+        deadline = monotonic() + self.max_wait_seconds
+        while task.get("status") in _PENDING_STATUSES:
+            delay = _poll_delay(task)
+            if delay >= deadline - monotonic():
+                break
+            await asyncio.sleep(delay)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            try:
+                task = await asyncio.wait_for(
+                    self.api_wrapper.ahumanize_get(task["taskId"]),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                break
+            except AICheckerHumanizerError as exc:
+                return _humanize_result(task, exc)
         return _humanize_result(task)
 
 
+class AICheckerHumanizerGetResultTool(BaseTool):
+    """Fetch an existing rewrite task."""
+
+    name: str = _GET_RESULT_NAME
+    description: str = (
+        "Fetch a rewrite task using its taskId as task_id. Returns task JSON with "
+        "the current status and rewritten text when available. Checking status or "
+        "fetching the result costs no credits. Results are available for about "
+        "70 minutes after submission."
+    )
+    args_schema: type[BaseModel] = _GetResultInput
+    api_wrapper: AICheckerHumanizerAPIWrapper = Field(
+        default_factory=AICheckerHumanizerAPIWrapper
+    )
+    handle_tool_error: bool = True
+
+    def _run(self, task_id: str) -> str:
+        try:
+            task = self.api_wrapper.humanize_get(task_id)
+        except AICheckerHumanizerError as exc:
+            raise ToolException(exc.message) from exc
+        return json.dumps(task, ensure_ascii=False)
+
+    async def _arun(self, task_id: str) -> str:
+        try:
+            task = await self.api_wrapper.ahumanize_get(task_id)
+        except AICheckerHumanizerError as exc:
+            raise ToolException(exc.message) from exc
+        return json.dumps(task, ensure_ascii=False)
+
+
 class AICheckerHumanizerToolkit(BaseToolkit):
-    """Use one API wrapper for both tools."""
+    """Share one API wrapper across the tools."""
 
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(
         default_factory=AICheckerHumanizerAPIWrapper
     )
 
     def get_tools(self) -> list[BaseTool]:
-        """Return the detection and rewriting tools."""
+        """Return the detection, rewriting and result tools."""
         return [
             AICheckerHumanizerDetectTool(api_wrapper=self.api_wrapper),
             AICheckerHumanizerHumanizeTool(api_wrapper=self.api_wrapper),
+            AICheckerHumanizerGetResultTool(api_wrapper=self.api_wrapper),
         ]

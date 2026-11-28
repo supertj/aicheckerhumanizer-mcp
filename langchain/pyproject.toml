@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "langchain-aicheckerhumanizer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "AI Checker Humanizer detection and rewriting tools for LangChain"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,13 +34,17 @@ dev = [
     "pytest-asyncio>=1.3,<2",
     "pytest-socket>=0.7,<1",
     "respx>=0.23.1,<1",
-    # 1.1.9 is the last release supporting Python 3.10.
-    "langchain-tests==1.1.9; python_version < '3.11'",
-    "langchain-tests==1.2.0; python_version >= '3.11'",
+    "langchain-tests==1.1.9",
     "ruff>=0.17,<1",
     "mypy>=2.4,<3",
 ]
 examples = ["langchain>=1.0,<2"]
+
+[tool.uv]
+exclude-newer = "2026-11-14T00:00:00Z"
+
+[tool.hatch.version]
+path = "langchain_aicheckerhumanizer/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["langchain_aicheckerhumanizer"]

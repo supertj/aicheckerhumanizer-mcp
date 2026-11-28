@@ -1,4 +1,4 @@
-"""Give a LangChain agent both tools."""
+"""Give a LangChain agent the AI Checker Humanizer toolkit."""
 
 import os
 

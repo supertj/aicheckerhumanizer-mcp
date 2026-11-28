@@ -1,8 +1,12 @@
 """Client for the AI Checker Humanizer REST API."""
 
+from __future__ import annotations
+
 from enum import Enum
+from functools import partial
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 from langchain_core.utils import secret_from_env
@@ -52,6 +56,14 @@ class AICheckerHumanizerError(Exception):
         self.credits_remaining = credits_remaining
         self.credits_needed = credits_needed
         self.max_words = max_words
+
+    def __reduce__(
+        self,
+    ) -> tuple[partial[AICheckerHumanizerError], tuple[()], dict[str, Any]]:
+        constructor = partial(
+            type(self), status=self.status, code=self.code, message=self.message
+        )
+        return constructor, (), self.__dict__
 
 
 def _seconds_header(response: httpx.Response) -> int | None:
@@ -115,19 +127,20 @@ def _parse_response(response: httpx.Response, *, is_task: bool) -> dict[str, Any
 
 
 def _request_error(
-    exc: httpx.RequestError | httpx.InvalidURL,
+    exc: httpx.RequestError | httpx.InvalidURL, *, submission_key: str | None = None
 ) -> AICheckerHumanizerError:
     if isinstance(exc, httpx.TimeoutException):
-        return AICheckerHumanizerError(
-            status=None,
-            code="timeout",
-            message="The request to AI Checker Humanizer timed out.",
+        code = "timeout"
+        message = "The request to AI Checker Humanizer timed out."
+    else:
+        code = "request_error"
+        message = "The request to AI Checker Humanizer could not be sent or completed."
+    if submission_key is not None:
+        message += (
+            " Retry with the same text and options. "
+            f"Set idempotency_key to {submission_key!r}."
         )
-    return AICheckerHumanizerError(
-        status=None,
-        code="request_error",
-        message="The request to AI Checker Humanizer could not be sent or completed.",
-    )
+    return AICheckerHumanizerError(status=None, code=code, message=message)
 
 
 class AICheckerHumanizerAPIWrapper(BaseModel):
@@ -174,7 +187,9 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
             "POST",
             "/humanize",
             data={"text": text, "mode": mode, "strength": strength},
-            idempotency_key=idempotency_key,
+            idempotency_key=(
+                str(uuid4()) if idempotency_key is None else idempotency_key
+            ),
         )
 
     async def ahumanize_start(
@@ -190,7 +205,9 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
             "POST",
             "/humanize",
             data={"text": text, "mode": mode, "strength": strength},
-            idempotency_key=idempotency_key,
+            idempotency_key=(
+                str(uuid4()) if idempotency_key is None else idempotency_key
+            ),
         )
 
     def humanize_get(
@@ -246,7 +263,9 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
                     json=data,
                 )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
-            raise _request_error(exc) from exc
+            raise _request_error(
+                exc, submission_key=idempotency_key if path == "/humanize" else None
+            ) from exc
         return _parse_response(response, is_task=path.startswith("/humanize"))
 
     async def _arequest(
@@ -269,5 +288,7 @@ class AICheckerHumanizerAPIWrapper(BaseModel):
                     json=data,
                 )
         except (httpx.RequestError, httpx.InvalidURL) as exc:
-            raise _request_error(exc) from exc
+            raise _request_error(
+                exc, submission_key=idempotency_key if path == "/humanize" else None
+            ) from exc
         return _parse_response(response, is_task=path.startswith("/humanize"))

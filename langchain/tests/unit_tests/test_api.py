@@ -1,4 +1,5 @@
 import json
+import pickle
 from typing import Any
 
 import httpx
@@ -9,6 +10,7 @@ from pydantic import SecretStr
 from langchain_aicheckerhumanizer import (
     AICheckerHumanizerAPIWrapper,
     AICheckerHumanizerError,
+    __version__,
 )
 
 BASE = "https://aicheckerhumanizer.com/api/v1"
@@ -27,7 +29,9 @@ def assert_request(
     assert (
         request.headers["Authorization"] == f"Bearer {api.api_key.get_secret_value()}"
     )
-    assert request.headers["User-Agent"] == "langchain-aicheckerhumanizer/0.1.0"
+    assert (
+        request.headers["User-Agent"] == f"langchain-aicheckerhumanizer/{__version__}"
+    )
     assert request.headers.get("Idempotency-Key") == key
     assert request.extensions["timeout"] == dict.fromkeys(
         ("connect", "read", "write", "pool"), api.timeout
@@ -155,6 +159,20 @@ def test_api_error_mapping(
     assert error.credits_remaining == extra.get("creditsRemaining")
     assert error.credits_needed == extra.get("creditsNeeded")
     assert error.max_words == extra.get("maxWords")
+
+
+def test_api_error_pickle_round_trip() -> None:
+    error = AICheckerHumanizerError(
+        status=402,
+        code="insufficient_credits",
+        message="Request failed.",
+        credits_remaining=2,
+        credits_needed=10,
+    )
+    restored = pickle.loads(pickle.dumps(error))
+    assert type(restored) is type(error)
+    assert restored.args == error.args
+    assert vars(restored) == vars(error)
 
 
 async def test_non_json_error(
