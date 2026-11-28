@@ -3,11 +3,16 @@
 import asyncio
 import json
 from asyncio import sleep as async_sleep
-from time import monotonic, sleep
-from typing import Any
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from contextvars import copy_context
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from langchain_core.tools import BaseTool, BaseToolkit, ToolException
+from langchain_core.tools import base as tool_base
 from pydantic import BaseModel, Field
 
 from .api import (
@@ -19,6 +24,12 @@ from .api import (
     HumanizeMode,
     HumanizeStrength,
 )
+
+if TYPE_CHECKING:
+    from langchain_core.tools.base import ToolExceptionHandlerOutput as _ToolErrorOutput
+else:
+    # Older LangChain versions only support string output from an error handler.
+    _ToolErrorOutput = getattr(tool_base, "ToolExceptionHandlerOutput", str)
 
 _PENDING_STATUSES = ("queued", "running", "pending")
 _DEFAULT_POLL_SECONDS = 3
@@ -73,14 +84,16 @@ class AICheckerHumanizerDetectTool(BaseTool):
         "verdict and scored word count. English and Portuguese can include sentence "
         "scores. If there is no verdict, the response gives a reason. "
         "The API charges 1 credit per scored word only when it returns a verdict. "
-        "If an error includes an idempotency_key, retry with that key and the same "
-        "text within 24 hours to avoid a second charge."
+        "If the error JSON includes idempotencyKey, pass it as idempotency_key "
+        "with the same text when retrying within 24 hours."
     )
     args_schema: type[BaseModel] = _DetectInput
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(
         default_factory=AICheckerHumanizerAPIWrapper
     )
-    handle_tool_error: bool = True
+    handle_tool_error: (
+        bool | str | Callable[[ToolException], _ToolErrorOutput] | None
+    ) = True
 
     def _run(self, text: str, idempotency_key: str | None = None) -> str:
         try:
@@ -109,7 +122,7 @@ def _poll_delay(task: dict[str, Any]) -> int:
 def _humanize_result(
     task: dict[str, Any],
     *,
-    skipped_words: int | None,
+    skipped_words: int | None = None,
     error: AICheckerHumanizerError | None = None,
 ) -> str:
     if task.get("status") in _PENDING_STATUSES:
@@ -118,7 +131,7 @@ def _humanize_result(
             "Set task_id to the returned taskId. "
             "Results are available for about 70 minutes after submission."
         )
-        fields = ("taskId", "status", "retryAfter")
+        fields = ("taskId", "status", "retryAfter", "skippedWords")
         task = {field: task[field] for field in fields if field in task}
         task["message"] = message
         if error is not None:
@@ -130,7 +143,7 @@ def _humanize_result(
                 "message": f"{error.message} {message}",
             }
     if skipped_words is not None:
-        task = {**task, "skippedWords": skipped_words}
+        task.setdefault("skippedWords", skipped_words)
     return json.dumps(task, ensure_ascii=False)
 
 
@@ -149,6 +162,8 @@ def _error_fields(error: AICheckerHumanizerError) -> dict[str, Any]:
         fields["httpStatus"] = error.status
     if error.retry_after is not None:
         fields["retryAfter"] = error.retry_after
+    if error.idempotency_key is not None:
+        fields["idempotencyKey"] = error.idempotency_key
     if error.status == 410 and "status" in fields:
         fields["taskStatus"] = fields["status"]
     return fields
@@ -172,18 +187,20 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
         "mode and light, medium or heavy strength. Defaults are standard and medium. "
         "The API charges 5 credits per original word for each chunk it rewrites "
         "successfully. Chunks under 10 words are billed as 10. "
-        "Repeat the same text and options "
-        "with the same idempotency_key within 24 hours to get the same task without "
-        "another charge. If an error includes an idempotency_key, reuse it when "
-        "you retry. Returns JSON with the rewritten text and any available "
-        "scores, or a task ID and status if the rewrite is still pending."
+        "Reusing an idempotency_key with the same text and options within 24 hours "
+        "returns the same task without another charge. If the error JSON includes "
+        "idempotencyKey, retry with it as idempotency_key. Returns JSON "
+        "with the rewritten text and any available scores, or a task ID and status "
+        "if the rewrite is still pending."
     )
     args_schema: type[BaseModel] = _HumanizeInput
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(
         default_factory=AICheckerHumanizerAPIWrapper
     )
     max_wait_seconds: float = Field(default=120, ge=0, allow_inf_nan=False)
-    handle_tool_error: bool = True
+    handle_tool_error: (
+        bool | str | Callable[[ToolException], _ToolErrorOutput] | None
+    ) = True
 
     def _run(
         self,
@@ -199,29 +216,27 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
         except AICheckerHumanizerError as exc:
             raise _tool_error(exc) from exc
 
-        skipped_words = task.get("skippedWords")
         if task.get("status") not in _PENDING_STATUSES or not self.max_wait_seconds:
-            return _humanize_result(task, skipped_words=skipped_words)
+            return _humanize_result(task)
 
         deadline = monotonic() + self.max_wait_seconds
-        with httpx.Client() as client:
-            while task.get("status") in _PENDING_STATUSES:
-                delay = _poll_delay(task)
-                if delay >= deadline - monotonic():
-                    break
-                sleep(delay)
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    task = self.api_wrapper.humanize_get(
-                        task["taskId"],
-                        timeout=min(self.api_wrapper.timeout, remaining),
-                        client=client,
-                    )
-                except AICheckerHumanizerError as exc:
-                    return _poll_error_result(task, exc, skipped_words=skipped_words)
-        return _humanize_result(task, skipped_words=skipped_words)
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            # Use a separate loop in this case and join its thread before returning.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(
+                    copy_context().run, self._poll_from_sync, task, deadline=deadline
+                ).result()
+
+        return self._poll_from_sync(task, deadline=deadline)
+
+    def _poll_from_sync(self, task: dict[str, Any], *, deadline: float) -> str:
+        # Closing the loop does not wait for an OS DNS lookup after cancellation.
+        with closing(asyncio.new_event_loop()) as loop:
+            return loop.run_until_complete(self._poll(task, deadline=deadline))
 
     async def _arun(
         self,
@@ -237,11 +252,13 @@ class AICheckerHumanizerHumanizeTool(BaseTool):
         except AICheckerHumanizerError as exc:
             raise _tool_error(exc) from exc
 
-        skipped_words = task.get("skippedWords")
         if task.get("status") not in _PENDING_STATUSES or not self.max_wait_seconds:
-            return _humanize_result(task, skipped_words=skipped_words)
+            return _humanize_result(task)
 
-        deadline = monotonic() + self.max_wait_seconds
+        return await self._poll(task, deadline=monotonic() + self.max_wait_seconds)
+
+    async def _poll(self, task: dict[str, Any], *, deadline: float) -> str:
+        skipped_words = task.get("skippedWords")
         async with httpx.AsyncClient() as client:
             while task.get("status") in _PENDING_STATUSES:
                 delay = _poll_delay(task)
@@ -285,7 +302,9 @@ class AICheckerHumanizerGetResultTool(BaseTool):
     api_wrapper: AICheckerHumanizerAPIWrapper = Field(
         default_factory=AICheckerHumanizerAPIWrapper
     )
-    handle_tool_error: bool = True
+    handle_tool_error: (
+        bool | str | Callable[[ToolException], _ToolErrorOutput] | None
+    ) = True
 
     def _run(self, task_id: str) -> str:
         try:

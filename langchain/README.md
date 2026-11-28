@@ -31,11 +31,13 @@ Each tool returns a JSON string on success and supports `ainvoke`. Detection acc
 - Mode can be `standard` (default), `academic`, `casual` or `concise`.
 - Strength can be `light`, `medium` (default) or `heavy`.
 
-By default, the rewrite tool gives status checks a 120-second budget after submission. If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If a status check fails with a temporary error, the response also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission.
+By default, the rewrite tool waits up to 120 seconds after submission, including the status checks and the pauses between them. Set `humanize.max_wait_seconds` to change the limit.
+
+If the rewrite is still pending when polling stops, you get the `taskId` and last known status. If a status check fails with a temporary error, the response also includes an `error` code. Check again with `get_result.invoke({"task_id": task_id})`. The result is available for about 70 minutes after submission.
 
 When the API reports an expired result, `get_result` returns `result_expired` with `httpStatus` 410. Resubmitting with the same `idempotency_key` within 24 hours reports the same error. The response also includes `taskStatus`, `creditsCharged` and `expiredAt` when available.
 
-`skippedWords` counts words left unchanged because their language is unsupported or the chosen mode is unavailable for that language. If the API returns the count when you submit, the rewrite tool includes it in both pending and final results.
+`skippedWords` counts words left unchanged because their language is unsupported or the chosen mode is unavailable for that language. If a status check leaves out `skippedWords`, the rewrite tool uses the count from submission when available.
 
 With the default error handling, a failed tool call returns a JSON string with the API's error fields and `httpStatus` if the server responded.
 
@@ -61,6 +63,6 @@ See `examples/agent.py` for a complete invocation.
 
 Detection costs 1 credit per scored word when there is a verdict. Rewriting costs 5 credits per original word in each chunk it successfully rewrites. A chunk is a paragraph or part of a long paragraph. Chunks under 10 words count as 10 for billing.
 
-Reuse the same `idempotency_key`, text and options within 24 hours to avoid another charge for a completed check or accepted rewrite. The detect and rewrite tools generate a key when you omit it. If an error includes the key, use it to retry the same request.
+Reuse the same `idempotency_key`, text and options within 24 hours to avoid another charge for a completed check or accepted rewrite. The detect and rewrite tools generate a key when you omit it. If the error JSON includes `idempotencyKey`, pass it as `idempotency_key` when retrying the same request. The field lets you recover a submission that may have reached the server. It appears on transport failures (including timeouts), response decoding failures, invalid 2xx responses, HTTP 5xx errors and `in_progress` errors.
 
 See the [API documentation](https://aicheckerhumanizer.com/docs/api) for response fields, errors and service limits.

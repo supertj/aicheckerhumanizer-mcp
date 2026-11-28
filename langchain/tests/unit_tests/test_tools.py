@@ -1,6 +1,7 @@
 import asyncio
 import json
-from unittest.mock import AsyncMock, Mock, patch
+from collections.abc import Callable
+from unittest.mock import AsyncMock, patch
 from uuid import UUID
 
 import httpx
@@ -43,7 +44,6 @@ INVALID_RESPONSE_ERROR = {
 class PollClock:
     def __init__(self) -> None:
         self.now = 0.0
-        self.sleep = Mock(side_effect=self.advance)
         self.async_sleep = AsyncMock(side_effect=self.advance)
 
     def monotonic(self) -> float:
@@ -57,7 +57,6 @@ class PollClock:
 def poll_clock(monkeypatch: pytest.MonkeyPatch) -> PollClock:
     clock = PollClock()
     monkeypatch.setattr(tool_module, "monotonic", clock.monotonic)
-    monkeypatch.setattr(tool_module, "sleep", clock.sleep)
     monkeypatch.setattr(tool_module, "async_sleep", clock.async_sleep)
     return clock
 
@@ -86,6 +85,8 @@ async def test_detect_retains_api_fields(
     [
         (httpx.ReadTimeout("Timed out"), "timeout"),
         (httpx.ReadError("Connection lost"), "request_error"),
+        (httpx.DecodingError("Invalid encoding"), "request_error"),
+        (httpx.Response(200, json={"message": "No score"}), "invalid_response"),
         (httpx.Response(502, html="<h1>Bad Gateway</h1>"), "http_error"),
         (httpx.Response(503, json={"error": "unavailable"}), "unavailable"),
         (httpx.Response(409, json={"error": "in_progress"}), "in_progress"),
@@ -117,10 +118,12 @@ async def test_detect_retries_with_the_key_from_the_error(
     assert isinstance(error, AICheckerHumanizerError)
     assert error.code == code
     assert error.idempotency_key == key
-    assert f"Set idempotency_key to {key!r}" in str(caught.value)
+    fields = json.loads(str(caught.value))
+    assert fields["idempotencyKey"] == key
+    assert f"Set idempotency_key to {key!r}" in fields["message"]
     assert route.call_count == 1
 
-    inputs["idempotency_key"] = error.idempotency_key
+    inputs["idempotency_key"] = fields["idempotencyKey"]
     result = await tool.ainvoke(inputs) if async_call else tool.invoke(inputs)
     assert json.loads(result) == detection
     retry = route.calls.last.request
@@ -129,11 +132,13 @@ async def test_detect_retries_with_the_key_from_the_error(
 
 
 @pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize("final_skipped_words", [None, 0])
 async def test_humanize_polls_for_result(
     api: AICheckerHumanizerAPIWrapper,
     respx_mock: respx.MockRouter,
     poll_clock: PollClock,
     async_call: bool,
+    final_skipped_words: int | None,
 ) -> None:
     start = respx_mock.post(f"{BASE}/humanize").respond(
         202,
@@ -153,6 +158,8 @@ async def test_humanize_polls_for_result(
         "creditsCharged": 50,
         "units": [{"text": "Original text.", "score": 13}],
     }
+    if final_skipped_words is not None:
+        expected["skippedWords"] = final_skipped_words
     poll = respx_mock.get(f"{BASE}/humanize/{TASK_ID}").mock(
         side_effect=[
             respx.MockResponse(json={"taskId": TASK_ID, "status": "running"}),
@@ -166,18 +173,21 @@ async def test_humanize_polls_for_result(
         "strength": "heavy",
         "idempotency_key": "rewrite-1",
     }
-    client_class = httpx.AsyncClient if async_call else httpx.Client
     with patch.object(
-        client_class, "request", autospec=True, side_effect=client_class.request
+        httpx.AsyncClient,
+        "request",
+        autospec=True,
+        side_effect=httpx.AsyncClient.request,
     ) as request:
         result = await tool.ainvoke(inputs) if async_call else tool.invoke(inputs)
-    submit_client, first_poll_client, second_poll_client = (
-        call.args[0] for call in request.call_args_list
-    )
-    assert submit_client is not first_poll_client
+    poll_calls = list(request.call_args_list)
+    if async_call:
+        submit_call, *poll_calls = poll_calls
+        assert submit_call.args[0] is not poll_calls[0].args[0]
+    first_poll_client, second_poll_client = (call.args[0] for call in poll_calls)
     assert first_poll_client is second_poll_client
     assert first_poll_client.is_closed
-    assert json.loads(result) == {**expected, "skippedWords": 4}
+    assert json.loads(result) == {"skippedWords": 4, **expected}
     assert poll.call_count == 2
     assert json.loads(start.calls.last.request.content) == {
         "text": "Original text.",
@@ -185,15 +195,7 @@ async def test_humanize_polls_for_result(
         "strength": "heavy",
     }
     assert start.calls.last.request.headers["Idempotency-Key"] == "rewrite-1"
-    if async_call:
-        assert [call.args[0] for call in poll_clock.async_sleep.await_args_list] == [
-            2,
-            3,
-        ]
-        poll_clock.sleep.assert_not_called()
-    else:
-        assert [call.args[0] for call in poll_clock.sleep.call_args_list] == [2, 3]
-        poll_clock.async_sleep.assert_not_called()
+    assert [call.args[0] for call in poll_clock.async_sleep.await_args_list] == [2, 3]
 
 
 @pytest.mark.parametrize("async_call", [False, True])
@@ -367,42 +369,37 @@ async def test_humanize_raises_on_permanent_poll_error(
     assert route.call_count == 1
 
 
-@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize("invocation", ["sync", "sync_in_loop", "async"])
 @pytest.mark.usefixtures("poll_clock")
 async def test_poll_timeout_at_deadline_returns_pending(
     api: AICheckerHumanizerAPIWrapper,
     respx_mock: respx.MockRouter,
     monkeypatch: pytest.MonkeyPatch,
-    async_call: bool,
+    invocation: str,
 ) -> None:
-    max_wait = 3.01 if async_call else 10
     respx_mock.post(f"{BASE}/humanize").respond(
         202, json={"taskId": TASK_ID, "status": "running"}
     )
-    tool = AICheckerHumanizerHumanizeTool(api_wrapper=api, max_wait_seconds=max_wait)
+    tool = AICheckerHumanizerHumanizeTool(api_wrapper=api, max_wait_seconds=3.01)
     inputs = {"text": "Draft"}
-    if async_call:
 
-        async def slow_poll(
-            task_id: str, *, client: httpx.AsyncClient
-        ) -> dict[str, str]:
-            assert not client.is_closed
-            await asyncio.sleep(0.1)
-            return {"taskId": task_id, "status": "completed"}
+    async def slow_poll(task_id: str, *, client: httpx.AsyncClient) -> dict[str, str]:
+        assert not client.is_closed
+        await asyncio.sleep(0.1)
+        return {"taskId": task_id, "status": "completed"}
 
-        poll = AsyncMock(side_effect=slow_poll)
-        monkeypatch.setattr(AICheckerHumanizerAPIWrapper, "ahumanize_get", poll)
+    poll = AsyncMock(side_effect=slow_poll)
+    monkeypatch.setattr(AICheckerHumanizerAPIWrapper, "ahumanize_get", poll)
+    if invocation == "async":
         result = await tool.ainvoke(inputs)
-        poll.assert_awaited_once()
-        assert poll.await_args is not None
-        assert poll.await_args.args == (TASK_ID,)
-        assert poll.await_args.kwargs["client"].is_closed
-    else:
-        route = respx_mock.get(f"{BASE}/humanize/{TASK_ID}").mock(
-            side_effect=httpx.ReadTimeout("Read timed out")
-        )
+    elif invocation == "sync_in_loop":
         result = tool.invoke(inputs)
-        assert route.calls.last.request.extensions["timeout"]["read"] == 7
+    else:
+        result = await asyncio.to_thread(tool.invoke, inputs)
+    poll.assert_awaited_once()
+    assert poll.await_args is not None
+    assert poll.await_args.args == (TASK_ID,)
+    assert poll.await_args.kwargs["client"].is_closed
     assert json.loads(result) == {
         "taskId": TASK_ID,
         "status": "running",
@@ -488,6 +485,39 @@ async def test_tool_error_fields(
     assert json.loads(message.content) == expected
 
 
+def _custom_error_handler(error: ToolException) -> str:
+    return f"Handled {json.loads(str(error))['error']}"
+
+
+@pytest.mark.parametrize("async_call", [False, True])
+@pytest.mark.parametrize(
+    ("handler", "expected"),
+    [
+        ("Try again later.", "Try again later."),
+        (_custom_error_handler, "Handled denied"),
+    ],
+)
+async def test_tools_accept_langchain_error_handlers(
+    api: AICheckerHumanizerAPIWrapper,
+    respx_mock: respx.MockRouter,
+    async_call: bool,
+    handler: str | Callable[[ToolException], str],
+    expected: str,
+) -> None:
+    respx_mock.post(f"{BASE}/detect").respond(403, json={"error": "denied"})
+    respx_mock.post(f"{BASE}/humanize").respond(403, json={"error": "denied"})
+    respx_mock.get(f"{BASE}/humanize/{TASK_ID}").respond(403, json={"error": "denied"})
+    calls = (
+        (AICheckerHumanizerDetectTool, {"text": "Draft"}),
+        (AICheckerHumanizerHumanizeTool, {"text": "Draft"}),
+        (AICheckerHumanizerGetResultTool, {"task_id": TASK_ID}),
+    )
+    for tool_class, inputs in calls:
+        tool = tool_class(api_wrapper=api, handle_tool_error=handler)
+        result = await tool.ainvoke(inputs) if async_call else tool.invoke(inputs)
+        assert result == expected
+
+
 @pytest.mark.parametrize("async_call", [False, True])
 async def test_expired_submission_replay_is_a_410_error(
     api: AICheckerHumanizerAPIWrapper, respx_mock: respx.MockRouter, async_call: bool
@@ -520,8 +550,11 @@ async def test_expired_submission_replay_is_a_410_error(
     "failure",
     [
         httpx.ReadError("Connection lost"),
+        httpx.DecodingError("Invalid encoding"),
         httpx.Response(502, text="Bad gateway"),
         httpx.Response(503, json={"error": "unavailable", "message": "Unavailable."}),
+        httpx.Response(202, text="Invalid submission response"),
+        httpx.Response(202, json={"status": "queued"}),
     ],
 )
 async def test_ambiguous_submission_error_exposes_key_for_retry(
@@ -553,10 +586,15 @@ async def test_ambiguous_submission_error_exposes_key_for_retry(
         assert UUID(sent_key).version == 4
     else:
         assert sent_key == key
-    assert f"Set idempotency_key to {sent_key!r}" in str(exc.value)
+    error = exc.value.__cause__
+    assert isinstance(error, AICheckerHumanizerError)
+    assert error.idempotency_key == sent_key
+    fields = json.loads(str(exc.value))
+    assert fields["idempotencyKey"] == sent_key
+    assert f"Set idempotency_key to {sent_key!r}" in fields["message"]
     assert route.call_count == 1
 
-    inputs["idempotency_key"] = sent_key
+    inputs["idempotency_key"] = fields["idempotencyKey"]
     result = await tool.ainvoke(inputs) if async_call else tool.invoke(inputs)
     assert json.loads(result)["taskId"] == TASK_ID
     retry = route.calls.last.request
@@ -568,18 +606,6 @@ async def test_ambiguous_submission_error_exposes_key_for_retry(
 @pytest.mark.parametrize(
     ("tool_class", "endpoint", "failure", "code"),
     [
-        (
-            AICheckerHumanizerDetectTool,
-            "/detect",
-            httpx.Response(200, json={"message": "No score"}),
-            "invalid_response",
-        ),
-        (
-            AICheckerHumanizerHumanizeTool,
-            "/humanize",
-            httpx.Response(202, text="Invalid submission response"),
-            "invalid_response",
-        ),
         (
             AICheckerHumanizerDetectTool,
             "/detect",
@@ -595,7 +621,13 @@ async def test_ambiguous_submission_error_exposes_key_for_retry(
         (
             AICheckerHumanizerDetectTool,
             "/detect",
-            httpx.DecodingError("Invalid encoding"),
+            httpx.UnsupportedProtocol("Unsupported protocol"),
+            "request_error",
+        ),
+        (
+            AICheckerHumanizerDetectTool,
+            "/detect",
+            httpx.InvalidURL("Invalid URL"),
             "request_error",
         ),
     ],
@@ -606,7 +638,7 @@ async def test_submission_errors_without_a_retry_hint(
     async_call: bool,
     tool_class: type[BaseTool],
     endpoint: str,
-    failure: httpx.Response | httpx.RequestError,
+    failure: httpx.Response | httpx.RequestError | httpx.InvalidURL,
     code: str,
 ) -> None:
     route = respx_mock.post(f"{BASE}{endpoint}").mock(side_effect=[failure])
@@ -621,6 +653,7 @@ async def test_submission_errors_without_a_retry_hint(
     assert isinstance(error, AICheckerHumanizerError)
     assert error.code == code
     assert error.idempotency_key is None
+    assert "idempotencyKey" not in json.loads(str(caught.value))
     assert "Retry with the same input" not in str(caught.value)
     assert "submission-1" not in str(caught.value)
     assert route.call_count == 1
